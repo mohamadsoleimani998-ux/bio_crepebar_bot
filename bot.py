@@ -1,603 +1,585 @@
 import os
-import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Optional, Tuple
-
-from aiohttp import web
+import asyncio
+from typing import Final, Optional, Dict, Any, List, Tuple
+from datetime import datetime
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputMediaPhoto
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup,
+    KeyboardButton, InputMediaPhoto, Audio
 )
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    ConversationHandler, CallbackQueryHandler, filters, ContextTypes
+    Application, ApplicationBuilder, ContextTypes, CommandHandler,
+    MessageHandler, CallbackQueryHandler, ConversationHandler, filters
 )
 
-# ===================== لاگینگ =====================
+# -------------------- Logging --------------------
 logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("bio_crepebar")
+log = logging.getLogger("crepebar")
 
-# ===================== تنظیمات از ENV =====================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# -------------------- ENV --------------------
+BOT_TOKEN: Final[str] = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("ENV BOT_TOKEN is missing")
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-INSTAGRAM_URL = os.getenv("INSTAGRAM_URL", "https://www.instagram.com/bio.crepebar")
-CASHBACK_PERCENT = float(os.getenv("CASHBACK_PERCENT", "3"))  # مثلاً ۳٪
+PUBLIC_URL = (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL", "")).rstrip("/")
+if not PUBLIC_URL:
+    raise RuntimeError("Set PUBLIC_URL (e.g. https://your-service.onrender.com)")
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # اگر نباشه میریم روی sqlite
+PORT = int(os.getenv("PORT", "10000"))
 
-# ===================== دیتابیس: Postgres یا SQLite =====================
-import sqlite3
-USE_PG = False
-try:
-    if DATABASE_URL:
-        import psycopg2
-        import psycopg2.extras
-        USE_PG = True
-except Exception as e:
-    log.warning("psycopg2 not available, fallback to SQLite. %s", e)
-    USE_PG = False
+# چند ادمین می‌تونه داشته باشه، با ویرگول جدا کن
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", "0")).split(",")
+    if x.strip().isdigit()
+}
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data.sqlite")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("ENV DATABASE_URL (Postgres DSN) is missing")
 
-def db_connect():
-    if USE_PG:
-        return psycopg2.connect(DATABASE_URL)
-    else:
-        return sqlite3.connect(DB_PATH)
+# -------------------- DB (psycopg2) --------------------
+import psycopg2
+import psycopg2.extras
 
-def db_exec(sql: str, params: Tuple = (), fetch: str = ""):
-    """
-    fetch: "" | "one" | "all"
-    """
-    conn = db_connect()
-    conn.set_session(autocommit=True) if USE_PG else None
-    try:
-        cur = conn.cursor()
-        cur.execute(sql, params)
-        if fetch == "one":
-            return cur.fetchone()
-        elif fetch == "all":
-            return cur.fetchall()
-        else:
+def db_conn():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+def db_exec(sql: str, args: Tuple = (), fetch: bool = False, many: bool = False):
+    with db_conn() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            if many and isinstance(args, list):
+                cur.executemany(sql, args)
+            else:
+                cur.execute(sql, args)
+            if fetch:
+                return cur.fetchall()
             return None
-    finally:
-        conn.close()
 
 def init_db():
-    if not USE_PG and not os.path.exists(DB_PATH):
-        open(DB_PATH, "a").close()
+    db_exec("""
+    CREATE TABLE IF NOT EXISTS users(
+      id BIGINT PRIMARY KEY,
+      name TEXT,
+      phone TEXT,
+      address TEXT,
+      wallet BIGINT DEFAULT 0,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS products(
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      price BIGINT NOT NULL,
+      photo_file_id TEXT,
+      active BOOLEAN DEFAULT TRUE
+    );
+    CREATE TABLE IF NOT EXISTS orders(
+      id SERIAL PRIMARY KEY,
+      user_id BIGINT REFERENCES users(id),
+      status TEXT DEFAULT 'new',
+      total BIGINT DEFAULT 0,
+      delivery_method TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS order_items(
+      id SERIAL PRIMARY KEY,
+      order_id INT REFERENCES orders(id) ON DELETE CASCADE,
+      product_id INT REFERENCES products(id),
+      qty INT NOT NULL,
+      price BIGINT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS wallet_tx(
+      id SERIAL PRIMARY KEY,
+      user_id BIGINT REFERENCES users(id),
+      amount BIGINT NOT NULL,
+      status TEXT DEFAULT 'pending', -- pending/approved/rejected
+      evidence_file_id TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS music(
+      id SERIAL PRIMARY KEY,
+      title TEXT,
+      file_id TEXT NOT NULL,
+      uploaded_by BIGINT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    """)
+    log.info("DB ready.")
 
-    # users
-    db_exec("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            full_name TEXT,
-            phone TEXT,
-            address TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # wallets
-    db_exec("""
-        CREATE TABLE IF NOT EXISTS wallets (
-            user_id BIGINT PRIMARY KEY,
-            balance INTEGER DEFAULT 0
-        )
-    """)
-    # products
-    db_exec("""
-        CREATE TABLE IF NOT EXISTS products (
-            id SERIAL PRIMARY KEY,
-            name TEXT NOT NULL,
-            price INTEGER NOT NULL,
-            photo_file_id TEXT
-        )
-    """)
-    # pending topups (کارت به کارت تا تأیید ادمین)
-    db_exec("""
-        CREATE TABLE IF NOT EXISTS topups (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            amount INTEGER NOT NULL,
-            receipt TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    # orders (ساده)
-    db_exec("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            product_id INTEGER NOT NULL,
-            qty INTEGER NOT NULL,
-            total INTEGER NOT NULL,
-            status TEXT DEFAULT 'created',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
+# -------------------- Helpers --------------------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-# ===================== کیبوردها =====================
-def main_menu(is_admin: bool = False):
+def main_menu_kb(is_admin_flag: bool) -> ReplyKeyboardMarkup:
     rows = [
-        ["منوی محصولات ☕️", "کیف پول 💸"],
-        ["اینستاگرام 📲", "حساب من 👤"],
-        ["🎵 موزیک‌های کافه", "🕹️ بازی‌ها"],
+        [KeyboardButton("منوی محصولات ☕️"), KeyboardButton("کیف پول 💸")],
+        [KeyboardButton("موزیک کافه 🎵"), KeyboardButton("بازی‌ها 🎮")],
+        [KeyboardButton("اینستاگرام 📲")],
     ]
-    if is_admin:
-        rows.append(["➕ افزودن محصول", "✏️ ویرایش محصول"])
-        rows.append(["✅ تأیید شارژها"])
+    if is_admin_flag:
+        rows.append([KeyboardButton("افزودن محصول ➕"), KeyboardButton("مدیریت محصولات ⚙️")])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-# ===================== استیت‌های گفتگو =====================
-(
-    ADD_NAME, ADD_PRICE, ADD_PHOTO,
-    EDIT_CHOOSE_ID, EDIT_CHOOSE_FIELD, EDIT_NEW_VALUE,
-    PROFILE_NAME, PROFILE_PHONE, PROFILE_ADDRESS,
-    TOPUP_AMOUNT, TOPUP_RECEIPT,
-    ORDER_CHOOSE_QTY, ORDER_DELIVERY,
-) = range(13)
-
-# ===================== ابزارها =====================
-def is_admin(user_id: int) -> bool:
-    return ADMIN_ID and user_id == ADMIN_ID
-
-def get_or_create_wallet(user_id: int) -> int:
-    row = db_exec("SELECT balance FROM wallets WHERE user_id = %s" if USE_PG else
-                  "SELECT balance FROM wallets WHERE user_id = ?", (user_id,), "one")
-    if row:
-        return int(row[0])
-    db_exec("INSERT INTO wallets(user_id, balance) VALUES (%s, 0)" if USE_PG else
-            "INSERT INTO wallets(user_id, balance) VALUES (?, 0)", (user_id,))
-    return 0
-
-def add_cashback(user_id: int, amount: int):
-    if CASHBACK_PERCENT <= 0:
-        return
-    bonus = int(amount * CASHBACK_PERCENT / 100)
-    db_exec("UPDATE wallets SET balance = balance + %s WHERE user_id = %s" if USE_PG else
-            "UPDATE wallets SET balance = balance + ? WHERE user_id = ?", (bonus, user_id))
-
-async def ensure_profile(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+async def ensure_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, Any]]:
     uid = update.effective_user.id
-    row = db_exec("SELECT full_name, phone, address FROM users WHERE user_id = %s" if USE_PG else
-                  "SELECT full_name, phone, address FROM users WHERE user_id = ?", (uid,), "one")
-    if not row or not row[0] or not row[1] or not row[2]:
-        await update.message.reply_text(
-            "برای ادامه، لطفاً پروفایل‌ت رو تکمیل کن.\nاسم‌ت رو بفرست:", reply_markup=ReplyKeyboardRemove()
-        )
-        return False
-    return True
+    rows = db_exec("SELECT * FROM users WHERE id=%s", (uid,), fetch=True)
+    return rows[0] if rows else None
 
-# ===================== دستورات =====================
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    # ثبت کاربر
-    db_exec("INSERT INTO users(user_id, full_name) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING" if USE_PG else
-            "INSERT OR IGNORE INTO users(user_id, full_name) VALUES (?, ?)",
-            (user.id, user.full_name or user.first_name))
-    get_or_create_wallet(user.id)
+# -------------------- Profile Flow --------------------
+ASK_NAME, ASK_PHONE, ASK_ADDRESS = range(3)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = await ensure_user(update, context)
+    if not user:
+        await update.message.reply_text("به بایو کرپ بار خوش اومدی ☕️\nاول یه معرفی کوچیک 👍\nاسم و فامیلت رو بفرست:")
+        return ASK_NAME
     await update.message.reply_text(
-        "به بایو کرپ بار خوش اومدی ☕️\nچطور می‌تونم کمک‌ت کنم؟",
-        reply_markup=main_menu(is_admin(user.id))
+        "☕️ به بایو کرپ بار خوش اومدی!",
+        reply_markup=main_menu_kb(is_admin(update.effective_user.id))
     )
-
-# ----------- منوها و دکمه‌های ساده
-async def open_instagram(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"اینستاگرام ما:\n{INSTAGRAM_URL}")
-
-async def my_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    row = db_exec("SELECT full_name, phone, address FROM users WHERE user_id = %s" if USE_PG else
-                  "SELECT full_name, phone, address FROM users WHERE user_id = ?", (uid,), "one")
-    name, phone, addr = (row or ("—","—","—"))
-    bal = get_or_create_wallet(uid)
-    await update.message.reply_text(
-        f"👤 حساب شما\nنام: {name}\nتلفن: {phone}\nآدرس: {addr}\n\n💰 کیف‌پول: {bal} تومان"
-    )
-
-# ----------- لیست محصولات
-async def show_products(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = db_exec("SELECT id, name, price, photo_file_id FROM products ORDER BY id DESC", fetch="all")
-    if not rows:
-        await update.message.reply_text("هنوز محصولی ثبت نشده است.")
-        return
-    for pid, name, price, fid in rows:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("سفارش 🛒", callback_data=f"order:{pid}")],
-            [InlineKeyboardButton("نمایش عکس 📷", callback_data=f"photo:{pid}") if fid else InlineKeyboardButton("—", callback_data="noop")]
-        ])
-        await update.message.reply_text(f"#{pid}\n{name}\nقیمت: {price:,} تومان", reply_markup=kb)
-
-async def cb_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, pid = q.data.split(":")
-    row = db_exec("SELECT name, photo_file_id FROM products WHERE id = %s" if USE_PG else
-                  "SELECT name, photo_file_id FROM products WHERE id = ?", (int(pid),), "one")
-    if row and row[1]:
-        await q.message.reply_photo(row[1], caption=row[0])
-    else:
-        await q.message.reply_text("برای این محصول عکسی ثبت نشده.")
-
-# ----------- سفارش (ساده)
-async def cb_order(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, pid = q.data.split(":")
-    ctx.user_data["order_pid"] = int(pid)
-    await q.message.reply_text("تعداد رو بفرست (مثلاً 1 یا 2):")
-    return ORDER_CHOOSE_QTY
-
-async def order_qty(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        qty = int(update.message.text.strip())
-        assert 1 <= qty <= 10
-    except:
-        await update.message.reply_text("لطفاً یک عدد 1 تا 10 بفرست.")
-        return ORDER_CHOOSE_QTY
-
-    uid = update.effective_user.id
-    # چک پروفایل
-    row = db_exec("SELECT full_name, phone, address FROM users WHERE user_id = %s" if USE_PG else
-                  "SELECT full_name, phone, address FROM users WHERE user_id = ?", (uid,), "one")
-    if not row or not row[0] or not row[1] or not row[2]:
-        await update.message.reply_text("برای تکمیل سفارش اول پروفایل رو تکمیل کنیم.\nاسم‌ت رو بفرست:", reply_markup=ReplyKeyboardRemove())
-        ctx.user_data["pending_after_profile"] = ("order", qty)
-        return PROFILE_NAME
-
-    pid = ctx.user_data["order_pid"]
-    prow = db_exec("SELECT price FROM products WHERE id = %s" if USE_PG else
-                   "SELECT price FROM products WHERE id = ?", (pid,), "one")
-    if not prow:
-        await update.message.reply_text("محصول پیدا نشد.")
-        return ConversationHandler.END
-    total = int(prow[0]) * qty
-
-    db_exec("INSERT INTO orders(user_id, product_id, qty, total) VALUES (%s,%s,%s,%s)" if USE_PG else
-            "INSERT INTO orders(user_id, product_id, qty, total) VALUES (?,?,?,?)",
-            (uid, pid, qty, total))
-
-    await update.message.reply_text(
-        f"سفارش ثبت شد ✅\nمبلغ قابل پرداخت: {total:,} تومان\n"
-        "می‌خوای پرداخت رو با «کیف پول» بدی یا کارت‌به‌کارت؟\n"
-        "برای کارت‌به‌کارت از منوی «کیف پول 💸» → «شارژ» استفاده کن."
-    )
-    add_cashback(uid, total)
     return ConversationHandler.END
 
-# ----------- پروفایل: اسم/تلفن/آدرس
-async def profile_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("اسم‌ت رو بفرست:", reply_markup=ReplyKeyboardRemove())
-    return PROFILE_NAME
+async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = (update.message.text or "").strip()
+    await update.message.reply_text("شماره موبایلت رو بفرست:")
+    return ASK_PHONE
 
-async def profile_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text("شماره موبایل:", reply_markup=ReplyKeyboardRemove())
-    return PROFILE_PHONE
+async def ask_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["phone"] = (update.message.text or "").strip()
+    await update.message.reply_text("آدرس تحویل رو بفرست:")
+    return ASK_ADDRESS
 
-async def profile_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("آدرس:", reply_markup=ReplyKeyboardRemove())
-    return PROFILE_ADDRESS
-
-async def profile_address(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["address"] = update.message.text.strip()
+async def finish_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data.get("name", "")
+    phone = context.user_data.get("phone", "")
+    address = (update.message.text or "").strip()
     uid = update.effective_user.id
     db_exec(
-        "INSERT INTO users(user_id, full_name, phone, address) VALUES (%s,%s,%s,%s) "
-        "ON CONFLICT (user_id) DO UPDATE SET full_name=EXCLUDED.full_name, phone=EXCLUDED.phone, address=EXCLUDED.address"
-        if USE_PG else
-        "INSERT INTO users(user_id, full_name, phone, address) VALUES (?,?,?,?) "
-        "ON CONFLICT(user_id) DO UPDATE SET full_name=excluded.full_name, phone=excluded.phone, address=excluded.address",
-        (uid, ctx.user_data["name"], ctx.user_data["phone"], ctx.user_data["address"])
+        "INSERT INTO users(id,name,phone,address) VALUES(%s,%s,%s,%s) "
+        "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, phone=EXCLUDED.phone, address=EXCLUDED.address",
+        (uid, name, phone, address)
     )
-    await update.message.reply_text("پروفایل ذخیره شد ✅", reply_markup=main_menu(is_admin(uid)))
-
-    # اگر به‌خاطر سفارش وارد شدیم
-    if ctx.user_data.get("pending_after_profile"):
-        kind, qty = ctx.user_data.pop("pending_after_profile")
-        if kind == "order":
-            await update.message.reply_text("حالا دوباره از «منوی محصولات» محصول‌ت رو انتخاب کن و سفارش بده.")
+    await update.message.reply_text("پروفایلت ثبت شد ✅", reply_markup=main_menu_kb(is_admin(uid)))
     return ConversationHandler.END
 
-# ----------- کیف پول و شارژ کارت‌به‌کارت
-async def wallet_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    bal = get_or_create_wallet(uid)
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("شارژ کیف پول 💳", callback_data="wallet:topup")],
-    ])
-    await update.message.reply_text(f"موجودی کیف پول: {bal:,} تومان", reply_markup=kb)
-
-async def cb_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "wallet:topup":
-        await q.message.reply_text("مبلغ شارژ (تومان) رو بفرست:")
-        return TOPUP_AMOUNT
-
-async def topup_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        amount = int(update.message.text.strip())
-        assert amount >= 10000
-    except:
-        await update.message.reply_text("لطفاً عدد معتبر (حداقل 10000) بفرست.")
-        return TOPUP_AMOUNT
-
-    ctx.user_data["topup_amount"] = amount
-    await update.message.reply_text(
-        "مبلغ رو کارت‌به‌کارت کن و **رسید/کد رهگیری** رو بفرست.\n"
-        "کارت: 6037-xxxx-xxxx-xxxx",
-        parse_mode="Markdown"
-    )
-    return TOPUP_RECEIPT
-
-async def topup_receipt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    amount = int(ctx.user_data["topup_amount"])
-    receipt = update.message.text.strip()
-    db_exec("INSERT INTO topups(user_id, amount, receipt) VALUES (%s,%s,%s)" if USE_PG else
-            "INSERT INTO topups(user_id, amount, receipt) VALUES (?,?,?)",
-            (uid, amount, receipt))
-    await update.message.reply_text("درخواست شارژ ثبت شد ✅\nپس از تأیید ادمین به کیف پول‌ت اضافه می‌شه.")
-    # اطلاع به ادمین
-    if ADMIN_ID:
-        await update.get_bot().send_message(
-            chat_id=ADMIN_ID,
-            text=f"درخواست شارژ جدید:\nUser: {uid}\nAmount: {amount}\nReceipt: {receipt}\nبرای تأیید: /approve_{uid}_{amount}"
-        )
+async def cancel_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("لغو شد.", reply_markup=main_menu_kb(is_admin(update.effective_user.id)))
     return ConversationHandler.END
 
-async def approve_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # فقط ادمین
-    if not is_admin(update.effective_user.id):
-        return
-    # فرمت: /approve_userid_amount
-    try:
-        _, uid, amount = update.message.text.strip().split("_")
-        uid = int(uid); amount = int(amount)
-    except:
-        await update.message.reply_text("فرمت درست: /approve_<uid>_<amount>")
-        return
-    db_exec("UPDATE wallets SET balance = COALESCE(balance,0) + %s WHERE user_id = %s" if USE_PG else
-            "UPDATE wallets SET balance = COALESCE(balance,0) + ? WHERE user_id = ?", (amount, uid))
-    db_exec("UPDATE topups SET status='approved' WHERE user_id=%s AND amount=%s AND status='pending'" if USE_PG else
-            "UPDATE topups SET status='approved' WHERE user_id=? AND amount=? AND status='pending'", (uid, amount))
-    await update.message.reply_text("شارژ تأیید شد ✅")
-    try:
-        await ctx.bot.send_message(uid, f"شارژ شما به مبلغ {amount:,} تومان تأیید شد ✅")
-    except:  # کاربر مسدود کرده باشد
-        pass
+# -------------------- Products (Admin) --------------------
+ADD_NAME, ADD_PRICE, ADD_PHOTO = range(10, 13)
+EDIT_CHOOSE, EDIT_FIELD, EDIT_VALUE, EDIT_PHOTO = range(13, 17)
 
-# ----------- افزودن محصول (ادمین)
-async def add_product_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def add_product_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("این بخش فقط برای ادمین است.")
-        return ConversationHandler.END
-    await update.message.reply_text("نام محصول را بفرست:", reply_markup=ReplyKeyboardRemove())
+        return await update.message.reply_text("فقط ادمین می‌تواند محصول اضافه کند.")
+    await update.message.reply_text("نام محصول؟")
     return ADD_NAME
 
-async def add_product_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["p_name"] = update.message.text.strip()
-    await update.message.reply_text("قیمت (تومان):")
+async def add_product_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["p_name"] = (update.message.text or "").strip()
+    await update.message.reply_text("قیمت (تومان)؟")
     return ADD_PRICE
 
-async def add_product_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def add_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        price = int(update.message.text.strip())
+        price = int((update.message.text or "0").replace(",", "").strip())
     except:
-        await update.message.reply_text("قیمت عددی بفرست.")
-        return ADD_PRICE
-    ctx.user_data["p_price"] = price
-    await update.message.reply_text("عکس محصول را ارسال کن (یا «رد» بنویس تا بدون عکس ثبت شود).")
+        return await update.message.reply_text("عدد معتبر وارد کن.")
+    context.user_data["p_price"] = price
+    await update.message.reply_text("عکس محصول رو بفرست (یا /skip برای بدون عکس).")
     return ADD_PHOTO
 
-async def add_product_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    fid = None
+async def save_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo_id = None
     if update.message.photo:
-        fid = update.message.photo[-1].file_id
-    elif update.message.text and update.message.text.strip() == "رد":
-        fid = None
-    else:
-        await update.message.reply_text("یک عکس بفرست یا بنویس «رد».")
-        return ADD_PHOTO
-
-    name = ctx.user_data["p_name"]; price = ctx.user_data["p_price"]
-    db_exec("INSERT INTO products(name, price, photo_file_id) VALUES (%s,%s,%s)" if USE_PG else
-            "INSERT INTO products(name, price, photo_file_id) VALUES (?,?,?)", (name, price, fid))
-    await update.message.reply_text("محصول با موفقیت ثبت شد ✅", reply_markup=main_menu(True))
+        photo_id = update.message.photo[-1].file_id
+    name = context.user_data["p_name"]
+    price = context.user_data["p_price"]
+    db_exec("INSERT INTO products(name,price,photo_file_id) VALUES(%s,%s,%s)", (name, price, photo_id))
+    await update.message.reply_text("محصول ثبت شد ✅")
     return ConversationHandler.END
 
-# ----------- ویرایش محصول (ادمین)
-async def edit_product_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def skip_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    name = context.user_data["p_name"]
+    price = context.user_data["p_price"]
+    db_exec("INSERT INTO products(name,price) VALUES(%s,%s)", (name, price))
+    await update.message.reply_text("محصول بدون عکس ثبت شد ✅")
+    return ConversationHandler.END
+
+async def admin_list_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
-        await update.message.reply_text("این بخش فقط برای ادمین است.")
-        return ConversationHandler.END
-    await update.message.reply_text("آی‌دی محصول را بفرست (شماره‌ای که کنار هر محصول می‌بینی).")
-    return EDIT_CHOOSE_ID
+        return await update.message.reply_text("اجازه دسترسی نداری.")
+    rows = db_exec("SELECT * FROM products ORDER BY id DESC", fetch=True)
+    if not rows:
+        return await update.message.reply_text("هنوز محصولی نداریم.")
+    kb = []
+    for r in rows:
+        kb.append([InlineKeyboardButton(f"#{r['id']} • {r['name']} ({r['price']:,})", callback_data=f"adm_edit:{r['id']}")])
+    await update.message.reply_text("مدیریت محصولات:", reply_markup=InlineKeyboardMarkup(kb))
 
-async def edit_product_choose_id(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        pid = int(update.message.text.strip())
-    except:
-        await update.message.reply_text("آی‌دی عددی بفرست.")
-        return EDIT_CHOOSE_ID
-    ctx.user_data["edit_pid"] = pid
-    kb = ReplyKeyboardMarkup([["نام"], ["قیمت"], ["عکس"], ["انصراف"]], resize_keyboard=True, one_time_keyboard=True)
-    await update.message.reply_text("کدام مورد را می‌خواهی ویرایش کنی؟", reply_markup=kb)
-    return EDIT_CHOOSE_FIELD
+async def admin_edit_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pid = int(q.data.split(":")[1])
+    context.user_data["edit_pid"] = pid
+    kb = [
+        [InlineKeyboardButton("نام", callback_data="edit_field:name"),
+         InlineKeyboardButton("قیمت", callback_data="edit_field:price")],
+        [InlineKeyboardButton("عکس", callback_data="edit_field:photo"),
+         InlineKeyboardButton("حذف", callback_data="edit_field:delete")],
+        [InlineKeyboardButton("بستن", callback_data="edit_field:close")]
+    ]
+    await q.edit_message_text(f"ویرایش محصول #{pid}", reply_markup=InlineKeyboardMarkup(kb))
+    return EDIT_CHOOSE
 
-async def edit_product_choose_field(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    if txt == "نام":
-        ctx.user_data["edit_field"] = "name"
-        await update.message.reply_text("نام جدید:", reply_markup=ReplyKeyboardRemove())
-        return EDIT_NEW_VALUE
-    elif txt == "قیمت":
-        ctx.user_data["edit_field"] = "price"
-        await update.message.reply_text("قیمت جدید (تومان):", reply_markup=ReplyKeyboardRemove())
-        return EDIT_NEW_VALUE
-    elif txt == "عکس":
-        ctx.user_data["edit_field"] = "photo"
-        await update.message.reply_text("عکس جدید را بفرست:", reply_markup=ReplyKeyboardRemove())
-        return EDIT_NEW_VALUE
-    else:
-        await update.message.reply_text("انجام نشد.", reply_markup=main_menu(True))
-        return ConversationHandler.END
-
-async def edit_product_new_value(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    pid = ctx.user_data["edit_pid"]
-    field = ctx.user_data["edit_field"]
+async def admin_edit_choose(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, field = q.data.split(":")
+    pid = context.user_data.get("edit_pid")
     if field == "name":
-        val = update.message.text.strip()
-        db_exec("UPDATE products SET name=%s WHERE id=%s" if USE_PG else
-                "UPDATE products SET name=? WHERE id=?", (val, pid))
-    elif field == "price":
-        try:
-            val = int(update.message.text.strip())
-        except:
-            await update.message.reply_text("قیمت معتبر بفرست.")
-            return EDIT_NEW_VALUE
-        db_exec("UPDATE products SET price=%s WHERE id=%s" if USE_PG else
-                "UPDATE products SET price=? WHERE id=?", (val, pid))
-    elif field == "photo":
-        if not update.message.photo:
-            await update.message.reply_text("یک عکس بفرست.")
-            return EDIT_NEW_VALUE
-        fid = update.message.photo[-1].file_id
-        db_exec("UPDATE products SET photo_file_id=%s WHERE id=%s" if USE_PG else
-                "UPDATE products SET photo_file_id=? WHERE id=?", (fid, pid))
-
-    await update.message.reply_text("ویرایش انجام شد ✅", reply_markup=main_menu(True))
+        await q.edit_message_text(f"نام جدید برای #{pid} را بفرست:")
+        return EDIT_VALUE
+    if field == "price":
+        await q.edit_message_text(f"قیمت جدید برای #{pid} را بفرست:")
+        context.user_data["expect_price"] = True
+        return EDIT_VALUE
+    if field == "photo":
+        await q.edit_message_text(f"عکس جدید برای #{pid} را بفرست:")
+        return EDIT_PHOTO
+    if field == "delete":
+        db_exec("DELETE FROM products WHERE id=%s", (pid,))
+        await q.edit_message_text("حذف شد ✅")
+        return ConversationHandler.END
+    await q.edit_message_text("بسته شد.")
     return ConversationHandler.END
 
-# ----------- موزیک و بازی (ساده)
-async def music_tab(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎵 لیست موزیک‌های کافه به‌زودی اینجا اضافه می‌شه.\nفعلاً می‌تونی موزیک دلخواهت رو همینجا آپلود کنی.")
+async def admin_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pid = context.user_data.get("edit_pid")
+    if context.user_data.get("expect_price"):
+        try:
+            price = int((update.message.text or "0").replace(",", ""))
+        except:
+            return await update.message.reply_text("عدد معتبر وارد کن:")
+        db_exec("UPDATE products SET price=%s WHERE id=%s", (price, pid))
+        context.user_data.pop("expect_price", None)
+        await update.message.reply_text("قیمت به‌روزرسانی شد ✅")
+        return ConversationHandler.END
+    else:
+        name = (update.message.text or "").strip()
+        db_exec("UPDATE products SET name=%s WHERE id=%s", (name, pid))
+        await update.message.reply_text("نام به‌روزرسانی شد ✅")
+        return ConversationHandler.END
 
-async def games_tab(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🕹️ بخش بازی‌ها به‌زودی؛ بعداً لیگ هفتگی و جایزه کیف‌پول اضافه می‌کنیم.")
+async def admin_edit_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pid = context.user_data.get("edit_pid")
+    if not update.message.photo:
+        return await update.message.reply_text("لطفاً عکس بفرست.")
+    file_id = update.message.photo[-1].file_id
+    db_exec("UPDATE products SET photo_file_id=%s WHERE id=%s", (file_id, pid))
+    await update.message.reply_text("عکس به‌روزرسانی شد ✅")
+    return ConversationHandler.END
 
-# ===================== کانورسیشن‌ها =====================
-add_product_conv = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex("^➕ افزودن محصول$"), add_product_start)],
-    states={
-        ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_name)],
-        ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_price)],
-        ADD_PHOTO: [
-            MessageHandler(filters.PHOTO, add_product_photo),
-            MessageHandler(filters.Regex("^رد$"), add_product_photo),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_photo),
-        ],
-    },
-    fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
-    name="add_product_conv",
-    persistent=False,
-)
+# -------------------- Products (User) & Cart --------------------
+def cart_get(ctx: ContextTypes.DEFAULT_TYPE) -> Dict[int, int]:
+    return ctx.user_data.setdefault("cart", {})
 
-edit_product_conv = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex("^✏️ ویرایش محصول$"), edit_product_start)],
-    states={
-        EDIT_CHOOSE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_choose_id)],
-        EDIT_CHOOSE_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_choose_field)],
-        EDIT_NEW_VALUE: [
-            MessageHandler(filters.PHOTO, edit_product_new_value),
-            MessageHandler(filters.TEXT & ~filters.COMMAND, edit_product_new_value),
-        ],
-    },
-    fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
-    name="edit_product_conv",
-    persistent=False,
-)
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db_exec("SELECT * FROM products WHERE active=TRUE ORDER BY id DESC", fetch=True)
+    if not rows:
+        return await update.message.reply_text("هنوز محصولی ثبت نشده.")
+    kb = []
+    for r in rows:
+        kb.append([InlineKeyboardButton(f"{r['name']} • {r['price']:,} تومان", callback_data=f"p:{r['id']}")])
+    await update.message.reply_text("منوی محصولات:", reply_markup=InlineKeyboardMarkup(kb))
 
-profile_conv = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex("^حساب من 👤$"), profile_start)],
-    states={
-        PROFILE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_name)],
-        PROFILE_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_phone)],
-        PROFILE_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_address)],
-    },
-    fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
-)
+async def product_detail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pid = int(q.data.split(":")[1])
+    rows = db_exec("SELECT * FROM products WHERE id=%s", (pid,), fetch=True)
+    if not rows: 
+        return await q.edit_message_text("پیدا نشد.")
+    p = rows[0]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ افزودن به سبد", callback_data=f"add:{pid}")],
+        [InlineKeyboardButton("بازگشت", callback_data="back:menu")]
+    ])
+    caption = f"{p['name']}\nقیمت: {p['price']:,} تومان"
+    if p["photo_file_id"]:
+        await q.message.reply_photo(p["photo_file_id"], caption=caption, reply_markup=kb)
+        try: await q.delete_message()
+        except: pass
+    else:
+        await q.edit_message_text(caption, reply_markup=kb)
 
-order_conv = ConversationHandler(
-    entry_points=[CallbackQueryHandler(cb_order, pattern=r"^order:\d+$")],
-    states={ORDER_CHOOSE_QTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, order_qty)]},
-    fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
-)
+async def add_to_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    pid = int(q.data.split(":")[1])
+    rows = db_exec("SELECT id,name,price FROM products WHERE id=%s", (pid,), fetch=True)
+    if not rows:
+        return await q.answer("یافت نشد", show_alert=True)
+    cart = cart_get(context)
+    cart[pid] = cart.get(pid, 0) + 1
+    await q.answer("به سبد اضافه شد ✅", show_alert=False)
 
-wallet_conv = ConversationHandler(
-    entry_points=[MessageHandler(filters.Regex("^کیف پول 💸$"), wallet_menu),
-                  CallbackQueryHandler(cb_wallet, pattern=r"^wallet:")],
-    states={
-        TOPUP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, topup_amount)],
-        TOPUP_RECEIPT: [MessageHandler(filters.TEXT & ~filters.COMMAND, topup_receipt)],
-    },
-    fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
-)
+async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    fake_update = Update.de_json({}, context.application.bot)  # فقط برای استفاده از تابع
+    fake_update.effective_user = q.from_user  # type: ignore
+    fake_update.message = q.message  # type: ignore
+    await show_menu(q, context)  # type: ignore
 
-# ===================== وب‌سرور سلامت برای Render =====================
-async def health(_request):
-    return web.Response(text="OK")
+async def show_cart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cart = cart_get(context)
+    if not cart:
+        return await update.message.reply_text("سبد خالیه.")
+    items = []
+    total = 0
+    for pid, qty in cart.items():
+        r = db_exec("SELECT id,name,price FROM products WHERE id=%s", (pid,), fetch=True)
+        if not r: continue
+        name, price = r[0]["name"], r[0]["price"]
+        items.append(f"- {name} × {qty} = {(price*qty):,}")
+        total += price * qty
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("تسویه و ثبت سفارش ✅", callback_data="checkout")],
+        [InlineKeyboardButton("خالی کردن سبد 🗑", callback_data="emptycart")]
+    ])
+    await update.message.reply_text("سبد خرید:\n" + "\n".join(items) + f"\n\nمجموع: {total:,} تومان", reply_markup=kb)
 
-async def run_http_server():
-    app = web.Application()
-    app.add_routes([web.get("/", health), web.get("/healthz", health)])
-    port = int(os.getenv("PORT", "10000"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-    log.info(f"HTTP health server started on :{port}")
+async def cart_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "emptycart":
+        context.user_data["cart"] = {}
+        return await q.edit_message_text("سبد خالی شد.")
+    if q.data == "checkout":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("ارسال پیک 🚚", callback_data="deliver:post")],
+            [InlineKeyboardButton("تحویل حضوری 🏠", callback_data="deliver:pickup")]
+        ])
+        return await q.edit_message_text("روش تحویل رو انتخاب کن:", reply_markup=kb)
 
-# ===================== MAIN =====================
-async def run_bot():
+async def checkout_delivery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    method = "ارسال" if q.data.endswith("post") else "حضوری"
+    cart = cart_get(context)
+    if not cart:
+        return await q.edit_message_text("سبد خالیه.")
+    uid = q.from_user.id
+    # محاسبه مبلغ
+    total = 0
+    rows_to_add = []
+    for pid, qty in cart.items():
+        p = db_exec("SELECT id,price FROM products WHERE id=%s", (pid,), fetch=True)[0]
+        total += p["price"] * qty
+        rows_to_add.append((pid, qty, p["price"]))
+    # ایجاد سفارش
+    db_exec("INSERT INTO orders(user_id,status,total,delivery_method) VALUES(%s,%s,%s,%s)", (uid, "new", total, method))
+    order_id = db_exec("SELECT currval(pg_get_serial_sequence('orders','id'))", fetch=True)[0]['currval']
+    db_exec("INSERT INTO order_items(order_id,product_id,qty,price) VALUES (%s,%s,%s,%s)",
+            [(order_id, pid, qty, price) for (pid, qty, price) in rows_to_add], many=True)
+    context.user_data["cart"] = {}
+    await q.edit_message_text(f"سفارش #{order_id} ثبت شد ✅\nمبلغ: {total:,} تومان\nروش تحویل: {method}")
+
+# -------------------- Wallet --------------------
+CHARGE_AMT, CHARGE_EVIDENCE = range(30, 32)
+
+async def wallet_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    r = db_exec("SELECT wallet FROM users WHERE id=%s", (uid,), fetch=True)
+    balance = r[0]["wallet"] if r else 0
+    await update.message.reply_text(f"موجودی: {balance:,} تومان\nبرای شارژ، «/charge» رو بزن.")
+
+async def charge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("مبلغ شارژ (تومان) را بفرست:")
+    return CHARGE_AMT
+
+async def charge_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amt = int((update.message.text or "0").replace(",", ""))
+        if amt <= 0:
+            raise ValueError
+    except:
+        return await update.message.reply_text("عدد معتبر بفرست:")
+    context.user_data["charge_amt"] = amt
+    await update.message.reply_text("رسید (عکس/اسکرین‌شات) را بفرست. /skip اگر فعلاً نداری.")
+    return CHARGE_EVIDENCE
+
+async def charge_evidence(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    amt = context.user_data["charge_amt"]
+    file_id = update.message.photo[-1].file_id if update.message.photo else None
+    db_exec("INSERT INTO wallet_tx(user_id,amount,status,evidence_file_id) VALUES(%s,%s,'pending',%s)", (uid, amt, file_id))
+    tx_id = db_exec("SELECT currval(pg_get_serial_sequence('wallet_tx','id'))", fetch=True)[0]['currval']
+    await update.message.reply_text("درخواست شارژ ثبت شد ✅. پس از تأیید ادمین اعمال می‌شود.")
+    # پیام به ادمین‌ها
+    for admin in ADMIN_IDS:
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("تأیید ✅", callback_data=f"tx:ok:{tx_id}:{uid}:{amt}"),
+                                    InlineKeyboardButton("رد ❌", callback_data=f"tx:no:{tx_id}:{uid}:{amt}")]])
+        if file_id:
+            await context.bot.send_photo(admin, file_id, caption=f"درخواست شارژ #{tx_id}\nUser: {uid}\nAmount: {amt:,}", reply_markup=kb)
+        else:
+            await context.bot.send_message(admin, f"درخواست شارژ #{tx_id}\nUser: {uid}\nAmount: {amt:,}", reply_markup=kb)
+    return ConversationHandler.END
+
+async def charge_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # بدون عکس
+    return await charge_evidence(update, context)
+
+async def tx_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, action, tx_id, uid, amt = q.data.split(":")
+    tx_id, uid, amt = int(tx_id), int(uid), int(amt)
+    if not is_admin(q.from_user.id):
+        return await q.answer("اجازه نداری", show_alert=True)
+    if action == "ok":
+        # اعمال به کیف پول
+        db_exec("UPDATE wallet_tx SET status='approved' WHERE id=%s", (tx_id,))
+        db_exec("UPDATE users SET wallet = COALESCE(wallet,0) + %s WHERE id=%s", (amt, uid))
+        await q.edit_message_caption(caption=(q.message.caption + "\n✅ تأیید شد") if q.message.caption else "✅ تأیید شد")
+        await context.bot.send_message(uid, f"شارژ کیف پول به مبلغ {amt:,} تومان تأیید شد ✅")
+    else:
+        db_exec("UPDATE wallet_tx SET status='rejected' WHERE id=%s", (tx_id,))
+        await q.edit_message_caption(caption=(q.message.caption + "\n❌ رد شد") if q.message.caption else "❌ رد شد")
+        await context.bot.send_message(uid, f"درخواست شارژ #{tx_id} رد شد ❌")
+
+# -------------------- Music --------------------
+async def music_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db_exec("SELECT * FROM music ORDER BY id DESC LIMIT 20", fetch=True)
+    if not rows:
+        return await update.message.reply_text("فعلاً موزیکی موجود نیست.")
+    for r in rows:
+        await update.message.reply_audio(r["file_id"], caption=r.get("title") or "Cafe Music")
+
+async def music_upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    a: Audio = update.message.audio
+    if not a:
+        return
+    title = a.title or a.file_name or "Cafe Music"
+    db_exec("INSERT INTO music(title,file_id,uploaded_by) VALUES(%s,%s,%s)", (title, a.file_id, update.effective_user.id))
+    await update.message.reply_text("موزیک ذخیره شد ✅")
+
+# -------------------- Command/Text Router --------------------
+async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").strip()
+    uid = update.effective_user.id
+    if txt == "منوی محصولات ☕️":
+        return await show_menu(update, context)
+    if txt == "کیف پول 💸":
+        return await wallet_info(update, context)
+    if txt == "اینستاگرام 📲":
+        return await update.message.reply_text("instagram.com/yourpage")
+    if txt == "موزیک کافه 🎵":
+        return await music_list(update, context)
+    if txt == "افزودن محصول ➕":
+        if is_admin(uid):
+            return await add_product_entry(update, context)
+        return await update.message.reply_text("اجازه دسترسی نداری.")
+    if txt == "مدیریت محصولات ⚙️":
+        return await admin_list_products(update, context)
+    if txt == "بازی‌ها 🎮":
+        return await update.message.reply_text("بخش بازی‌ها به‌زودی… 🎯")
+    if txt == "/cart":
+        return await show_cart(update, context)
+    return await update.message.reply_text("از منو استفاده کن یا /cart برای دیدن سبد.")
+
+# -------------------- Webhook boot --------------------
+async def run() -> None:
     init_db()
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+    # profile
+    profile_conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_phone)],
+            ASK_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_address)],
+            ASK_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_profile)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_profile)],
+    )
+    app.add_handler(profile_conv)
 
-    # دستورات
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.Regex("^اینستاگرام 📲$"), open_instagram))
-    application.add_handler(MessageHandler(filters.Regex("^منوی محصولات ☕️$"), show_products))
-    application.add_handler(MessageHandler(filters.Regex("^🎵 موزیک‌های کافه$"), music_tab))
-    application.add_handler(MessageHandler(filters.Regex("^🕹️ بازی‌ها$"), games_tab))
+    # add product
+    add_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^افزودن محصول ➕$"), add_product_entry)],
+        states={
+            ADD_NAME:   [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_price)],
+            ADD_PRICE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_photo)],
+            ADD_PHOTO:  [
+                MessageHandler(filters.PHOTO, save_product),
+                CommandHandler("skip", skip_product_photo),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_profile)],
+        name="add_product",
+        persistent=False
+    )
+    app.add_handler(add_conv)
 
-    application.add_handler(add_product_conv)
-    application.add_handler(edit_product_conv)
-    application.add_handler(profile_conv)
-    application.add_handler(order_conv)
-    application.add_handler(wallet_conv)
+    # edit product (admin)
+    edit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_edit_entry, pattern=r"^adm_edit:\d+$")],
+        states={
+            EDIT_CHOOSE: [CallbackQueryHandler(admin_edit_choose, pattern=r"^edit_field:")],
+            EDIT_VALUE:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_value)],
+            EDIT_PHOTO:  [MessageHandler(filters.PHOTO, admin_edit_photo)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_profile)],
+        name="edit_product",
+        persistent=False
+    )
+    app.add_handler(edit_conv)
 
-    application.add_handler(CallbackQueryHandler(cb_photo, pattern=r"^photo:\d+$"))
-    application.add_handler(CommandHandler("approve", approve_cmd))  # /approve_uid_amount
+    # products / cart / checkout
+    app.add_handler(MessageHandler(filters.Regex("^منوی محصولات ☕️$"), show_menu))
+    app.add_handler(CallbackQueryHandler(product_detail, pattern=r"^p:\d+$"))
+    app.add_handler(CallbackQueryHandler(add_to_cart, pattern=r"^add:\d+$"))
+    app.add_handler(CallbackQueryHandler(back_to_menu, pattern=r"^back:menu$"))
+    app.add_handler(CommandHandler("cart", show_cart))
+    app.add_handler(CallbackQueryHandler(cart_buttons, pattern=r"^(emptycart|checkout)$"))
+    app.add_handler(CallbackQueryHandler(checkout_delivery, pattern=r"^deliver:(post|pickup)$"))
 
-    # منوی پیش‌فرض هنگام پیام‌های ناشناخته
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, start))
+    # wallet
+    app.add_handler(CommandHandler("wallet", wallet_info))
+    charge_conv = ConversationHandler(
+        entry_points=[CommandHandler("charge", charge_start)],
+        states={
+            CHARGE_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, charge_amount)],
+            CHARGE_EVIDENCE: [
+                MessageHandler(filters.PHOTO, charge_evidence),
+                CommandHandler("skip", charge_skip),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_profile)],
+        name="charge",
+        persistent=False
+    )
+    app.add_handler(charge_conv)
+    app.add_handler(CallbackQueryHandler(tx_admin_buttons, pattern=r"^tx:(ok|no):"))
 
-    # اجرای polling داخل همین پروسه
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-    log.info("Bot polling started.")
-    # زنده نگه داشتن
-    await asyncio.Event().wait()
+    # music
+    app.add_handler(MessageHandler(filters.AUDIO, music_upload))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-async def main():
-    # همزمان هم health-server و هم ربات
-    await asyncio.gather(run_http_server(), run_bot())
+    # webhook
+    url_path = BOT_TOKEN
+    webhook_url = f"{PUBLIC_URL}/{url_path}"
+    await app.bot.set_webhook(webhook_url, drop_pending_updates=True)
+    await app.run_webhook(listen="0.0.0.0", port=PORT, url_path=url_path, webhook_url=webhook_url)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        log.info("Bot stopped.")
+    asyncio.run(run())
