@@ -1,7 +1,10 @@
 import os, re, asyncio, logging
 from typing import Dict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
 from aiohttp import web
 
 # -------- Logging --------
@@ -9,9 +12,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("bio-crepebar-bot")
 
 # -------- Config --------
-TOKEN = os.environ.get("TELEGRAM_TOKEN")            # تو Render ست کن
+TOKEN = os.environ.get("TELEGRAM_TOKEN")          # در Render ست کن
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-PORT = int(os.environ.get("PORT", "10000"))
+PORT = int(os.environ.get("PORT", "10000"))       # Render می‌سازد
 
 # -------- Data (in-memory) --------
 products: Dict[str, int] = {
@@ -26,7 +29,9 @@ cashback_percent = 3
 EMOJI_RE = re.compile(r'[\u200d\uFE0F\u2600-\u27BF\U0001F300-\U0001FAFF]+')
 def norm(s: str) -> str:
     return EMOJI_RE.sub("", s or "").replace(" ", "").strip()
-def is_admin(uid: int) -> bool: return uid in ADMIN_IDS
+
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
 
 def main_menu():
     return ReplyKeyboardMarkup(
@@ -46,15 +51,33 @@ def admin_kb():
         [InlineKeyboardButton("⬅️ خروج", callback_data="admin:exit")],
     ])
 
+# -------- Debug helpers --------
+async def echo_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        d = update.to_dict() if hasattr(update, "to_dict") else str(update)
+    except Exception:
+        d = str(update)
+    print(f"RAW UPDATE: {d}")
+
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    import traceback
+    print("ERROR:", "".join(traceback.format_exception(None, context.error, context.error.__traceback__)))
+
 # -------- Commands --------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     users.setdefault(uid, {"wallet": 0, "name": None, "phone": None})
-    await update.message.reply_text("به بایو کرپ بار خوش اومدی ☕️\nچطور می‌تونم کمکت کنم؟", reply_markup=main_menu())
+    await update.message.reply_text(
+        "به بایو کرپ بار خوش اومدی ☕️\nچطور می‌تونم کمکت کنم؟",
+        reply_markup=main_menu()
+    )
 
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    await update.message.reply_text(f"ID شما: `{u.id}`\nUsername: @{u.username}", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"ID شما: `{u.id}`\nUsername: @{u.username}",
+        parse_mode="Markdown"
+    )
 
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -66,8 +89,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------- Admin callbacks/text --------
 async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    if not is_admin(q.from_user.id): return await q.edit_message_text("⛔️ دسترسی ندارید.")
+    q = update.callback_query
+    await q.answer()
+    if not is_admin(q.from_user.id):
+        return await q.edit_message_text("⛔️ دسترسی ندارید.")
     data = q.data.split(":")[1]
 
     if data == "list":
@@ -86,9 +111,11 @@ async def admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(tips, reply_markup=admin_kb())
 
 async def admin_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id): return
+    if not is_admin(update.effective_user.id):
+        return
     mode = context.user_data.get("admin_mode")
-    if not mode: return
+    if not mode:
+        return
     text = (update.message.text or "").strip()
     global cashback_percent
     try:
@@ -132,7 +159,7 @@ async def public_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "حسابمن" in key:
         u = users[uid]
         if not u.get("name") or not u.get("phone"):
-            return await update.message.reply_text("نام - شماره را بفرست (مثال: علی - 0912...)")
+            return await update.message.reply_text("نام - شماره را بفرست (مثال: علی - 0912... )")
         return await update.message.reply_text(f"نام: {u['name']}\nشماره: {u['phone']}\nموجودی: {u['wallet']:,} تومان")
 
     if " - " in text and (users[uid]["name"] is None or users[uid]["phone"] is None):
@@ -140,7 +167,7 @@ async def public_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name, phone = [p.strip() for p in text.split(" - ", 1)]
             users[uid]["name"], users[uid]["phone"] = name, phone
             return await update.message.reply_text("✅ اطلاعات ثبت شد.")
-        except:  # noqa
+        except Exception:
             return await update.message.reply_text("فرمت نادرست. مثال: علی - 0912...")
 
     if "کیفپول" in key:
@@ -165,7 +192,9 @@ async def public_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text(f"✅ {amount:,} تومان به کیف پول اضافه شد.")
         return await update.message.reply_text("مبلغ نامعتبر است.")
 
-    return await update.message.reply_text("از دکمه‌ها استفاده کن یا /help را ببین.", reply_markup=main_menu())
+    # --- Fallback: اگر هیچ شرطی نخورد باز هم جواب بده
+    await update.message.reply_text("دریافت شد ✅ — اگر گزینه‌ای جواب نداد، /help را بزن.", reply_markup=main_menu())
+    return
 
 # -------- Inline (اختیاری) --------
 async def inline_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -181,21 +210,28 @@ async def inline_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # -------- Run (polling + health) --------
 async def run():
-    if not TOKEN: raise RuntimeError("TELEGRAM_TOKEN env var missing")
+    if not TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN env var missing")
 
     app = Application.builder().token(TOKEN).build()
 
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("whoami", cmd_whoami))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("help", cmd_help))
+    # لاگ خام همه آپدیت‌ها قبل از هر چیز
+    app.add_handler(MessageHandler(filters.ALL, echo_log), group=-1)
+    app.add_error_handler(on_error)
 
-    # Admin + Public
-    app.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^admin:"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text))
-    app.add_handler(CallbackQueryHandler(inline_menu, pattern=r"^(menu|wallet)$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, public_text))
+    # Commands (group 0)
+    app.add_handler(CommandHandler("start", cmd_start), group=0)
+    app.add_handler(CommandHandler("whoami", cmd_whoami), group=0)
+    app.add_handler(CommandHandler("admin", cmd_admin), group=0)
+    app.add_handler(CommandHandler("help", cmd_help), group=0)
+
+    # Admin (group 1)
+    app.add_handler(CallbackQueryHandler(admin_buttons, pattern=r"^admin:"), group=1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, admin_text), group=1)
+
+    # Public (group 2)
+    app.add_handler(CallbackQueryHandler(inline_menu, pattern=r"^(menu|wallet)$"), group=2)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, public_text), group=2)
 
     # Health server (Render)
     async def health(_): return web.Response(text="ok")
