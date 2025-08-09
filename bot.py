@@ -1,73 +1,65 @@
-# bot.py
 import os
-import asyncio
-import threading
+import logging
+from typing import Final
 
-from flask import Flask, request, abort
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application, ApplicationBuilder,
+    CommandHandler, MessageHandler, CallbackContext,
+    filters,
+)
 
-# ======= ENV =======
-BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
-WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
-PORT = int(os.environ.get("PORT", "5000"))
+# ---------- logging ----------
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("crepebar-bot")
 
-# آدرس نهایی وبهوک (به /webhook ختم می‌شود)
-WEBHOOK_URL = f"{WEBHOOK_BASE}/webhook" if WEBHOOK_BASE else None
+# ---------- env ----------
+BOT_TOKEN: Final[str] = os.environ["BOT_TOKEN"].strip()
+WEBHOOK_BASE: Final[str] = os.environ.get("WEBHOOK_BASE", "").strip().rstrip("/")
+WEBHOOK_SECRET: Final[str] = os.environ.get("WEBHOOK_SECRET", "").strip()
+PORT: Final[int] = int(os.environ.get("PORT", "5000"))
 
-# ======= Telegram App =======
-application = Application.builder().token(BOT_TOKEN).build()
+if not WEBHOOK_BASE:
+    raise RuntimeError("WEBHOOK_BASE is not set")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET is not set")
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ربات فعاله ✅")
+# مسیر وبهوک امن (از bot id استفاده می‌کنیم؛ توکن کامل لو نمی‌رود)
+WEBHOOK_PATH: Final[str] = f"/webhook/{BOT_TOKEN.split(':', 1)[0]}"
+WEBHOOK_URL: Final[str] = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
 
-application.add_handler(CommandHandler("start", start_cmd))
-
-# ======= Flask (WSGI) =======
-app = Flask(__name__)
-
-@app.get("/")
-def health():
-    return "OK", 200
-
-@app.post("/webhook")
-def telegram_webhook():
-    # تطابق سکرت برای امنیت
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        abort(401)
-
-    data = request.get_json(force=True, silent=False)
-    update = Update.de_json(data, application.bot)
-
-    # پردازش آپدیت داخل حلقه‌ی asyncio پس‌زمینه
-    fut = asyncio.run_coroutine_threadsafe(
-        application.process_update(update), _LOOP
+# ---------- handlers ----------
+async def start(update: Update, context: CallbackContext) -> None:
+    user = update.effective_user
+    name = (user.first_name or "") if user else ""
+    await update.message.reply_text(
+        f"سلام {name} 👋\nربات فعاله. برای تست، هر متنی بفرست تا برگردونم."
     )
-    # اگر خطایی در coroutine رخ دهد، در لاگ بالا می‌آید
-    try:
-        fut.result(timeout=10)
-    except Exception:
-        # اجازه می‌دهیم Gunicorn خطا را لاگ کند
-        pass
-    return "OK", 200
 
-# ======= Background asyncio loop just for PTB processing =======
-def _run_event_loop(loop: asyncio.AbstractEventLoop):
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(application.initialize())
-    loop.run_until_complete(application.start())
+async def echo(update: Update, context: CallbackContext) -> None:
+    if update.message and update.message.text:
+        await update.message.reply_text(update.message.text)
 
-    # ست‌کردن وبهوک یکبار پس از شروع
-    async def _ensure_webhook():
-        if WEBHOOK_URL:
-            await application.bot.set_webhook(
-                url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET
-            )
-    loop.run_until_complete(_ensure_webhook())
+# ---------- app ----------
+def build_app() -> Application:
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    return app
 
-    loop.run_forever()
+if __name__ == "__main__":
+    app = build_app()
 
-_LOOP = asyncio.new_event_loop()
-threading.Thread(target=_run_event_loop, args=(_LOOP,), daemon=True).start()
+    log.info("Setting webhook to %s", WEBHOOK_URL)
+    # وب‌سرور داخلی PTB (aiohttp) — دیگه نیازی به Flask/Gunicorn نیست
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH.lstrip("/"),
+        secret_token=WEBHOOK_SECRET,
+        webhook_url=WEBHOOK_URL,
+        drop_pending_updates=False,
+    )
