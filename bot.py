@@ -1,79 +1,73 @@
+# bot.py
 import os
-import logging
-import requests
-from flask import Flask, request, Response, jsonify
+import asyncio
+import threading
 
-# ---------- Config ----------
-BOT_TOKEN      = os.environ["BOT_TOKEN"].strip()
-WEBHOOK_BASE   = os.environ["WEBHOOK_BASE"].rstrip("/")
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"].strip()
+from flask import Flask, request, abort
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL  = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+# ======= ENV =======
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
+PORT = int(os.environ.get("PORT", "5000"))
 
-API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# آدرس نهایی وبهوک (به /webhook ختم می‌شود)
+WEBHOOK_URL = f"{WEBHOOK_BASE}/webhook" if WEBHOOK_BASE else None
 
-# ---------- App ----------
+# ======= Telegram App =======
+application = Application.builder().token(BOT_TOKEN).build()
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("ربات فعاله ✅")
+
+application.add_handler(CommandHandler("start", start_cmd))
+
+# ======= Flask (WSGI) =======
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("crepebar-bot")
 
-def tg_api(method: str, payload: dict) -> dict:
-    """Call Telegram Bot API (sync)."""
-    url = f"{API_BASE}/{method}"
-    r = requests.post(url, json=payload, timeout=15)
-    if not r.ok:
-        log.error("Telegram API %s failed: %s - %s", method, r.status_code, r.text)
-    return r.json() if r.text else {}
-
-def set_webhook():
-    payload = {
-        "url": WEBHOOK_URL,
-        "secret_token": WEBHOOK_SECRET,
-        "drop_pending_updates": True,
-        "allowed_updates": ["message", "callback_query"]
-    }
-    res = tg_api("setWebhook", payload)
-    log.info("setWebhook -> %s", res)
-
-# ---------- Routes ----------
 @app.get("/")
 def health():
-    return jsonify(status="ok", webhook=WEBHOOK_URL), 200
+    return "OK", 200
 
-@app.post(WEBHOOK_PATH)
+@app.post("/webhook")
 def telegram_webhook():
-    # امنیت: تطبیق Secret Token
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret != WEBHOOK_SECRET:
-        return Response(status=401)
+    # تطابق سکرت برای امنیت
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        abort(401)
 
-    update = request.get_json(silent=True) or {}
-    message = update.get("message") or {}
-    text = (message.get("text") or "").strip()
-    chat = message.get("chat") or {}
-    chat_id = chat.get("id")
+    data = request.get_json(force=True, silent=False)
+    update = Update.de_json(data, application.bot)
 
-    if chat_id and text:
-        if text.startswith("/start"):
-            tg_api("sendMessage", {
-                "chat_id": chat_id,
-                "text": "سلام! 👋\nربات بیو کِرپ‌بار فعاله. از منوی پایین برای شروع استفاده کن.",
-                "parse_mode": "HTML"
-            })
-        # جا برای فیچرهای بعدی...
+    # پردازش آپدیت داخل حلقه‌ی asyncio پس‌زمینه
+    fut = asyncio.run_coroutine_threadsafe(
+        application.process_update(update), _LOOP
+    )
+    # اگر خطایی در coroutine رخ دهد، در لاگ بالا می‌آید
+    try:
+        fut.result(timeout=10)
+    except Exception:
+        # اجازه می‌دهیم Gunicorn خطا را لاگ کند
+        pass
+    return "OK", 200
 
-    return Response(status=200)
+# ======= Background asyncio loop just for PTB processing =======
+def _run_event_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.initialize())
+    loop.run_until_complete(application.start())
 
-# ---------- Startup ----------
-# توجه: در Flask 3، before_first_request حذف شده. پس مستقیم اینجا وبهوک رو ست می‌کنیم.
-try:
-    set_webhook()
-    log.info("Webhook set to %s", WEBHOOK_URL)
-except Exception as e:
-    log.exception("Failed to set webhook: %s", e)
+    # ست‌کردن وبهوک یکبار پس از شروع
+    async def _ensure_webhook():
+        if WEBHOOK_URL:
+            await application.bot.set_webhook(
+                url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET
+            )
+    loop.run_until_complete(_ensure_webhook())
 
-# برای Gunicorn: متغیر app باید وجود داشته باشه
-# اگر محلی اجرا می‌کنی، می‌تونی این بلوک رو فعال کنی:
-# if __name__ == "__main__":
-#     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    loop.run_forever()
+
+_LOOP = asyncio.new_event_loop()
+threading.Thread(target=_run_event_loop, args=(_LOOP,), daemon=True).start()
