@@ -1,226 +1,171 @@
 import os
 import logging
-from typing import Optional, Tuple
+from datetime import datetime
 
-import psycopg2
-import psycopg2.extras
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+    Application, CommandHandler, MessageHandler, ContextTypes,
+    CallbackQueryHandler, filters
 )
+
+import psycopg
+from psycopg.rows import dict_row
+
+# ---------- Config ----------
+BOT_TOKEN      = os.environ["BOT_TOKEN"]                          
+DATABASE_URL   = os.environ["DATABASE_URL"]                       
+WEBHOOK_URL    = os.environ["WEBHOOK_URL"].rstrip("/")            
+ADMIN_IDS      = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.strip().isdigit()}
+CASHBACK_PCT   = int(os.getenv("CASHBACK_PERCENT", "3"))
+PORT           = int(os.getenv("PORT", "10000"))                  
+WEBHOOK_PATH   = f"/webhook/{BOT_TOKEN}"                          
 
 # ---------- Logging ----------
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
-log = logging.getLogger("bio-crepebar-bot")
+log = logging.getLogger("crepebar-bot")
 
-# ---------- ENV ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env is required")
-
-WEBHOOK_BASE = (os.getenv("WEBHOOK_BASE") or os.getenv("WEBHOOK_URL") or "").rstrip("/")
-if not WEBHOOK_BASE:
-    raise RuntimeError("WEBHOOK_BASE (e.g. https://bio-crepebar-bot.onrender.com) env is required")
-
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # اختیاری
-PORT = int(os.getenv("PORT", "8000"))
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL env is required (Neon)")
-if "sslmode" not in DATABASE_URL:
-    DATABASE_URL += ("&sslmode=require" if "?" in DATABASE_URL else "?sslmode=require")
-
-ADMIN_IDS = {
-    int(x) for x in (os.getenv("ADMIN_IDS") or "").replace(" ", "").split(",") if x.strip().isdigit()
-}
-CASHBACK_PERCENT = float(os.getenv("CASHBACK_PERCENT") or 3.0)  # پیش‌فرض ۳٪
-
-# ---------- DB ----------
+# ---------- DB helpers ----------
 def db_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row, autocommit=True)
 
-def run_migrations():
+def init_db():
     sql = """
     CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        tg_id BIGINT UNIQUE NOT NULL,
-        username TEXT,
-        first_name TEXT,
-        created_at TIMESTAMPTZ DEFAULT NOW(),
-        cashback_total INTEGER NOT NULL DEFAULT 0
+        tg_id       BIGINT PRIMARY KEY,
+        username    TEXT,
+        first_name  TEXT,
+        last_name   TEXT,
+        joined_at   TIMESTAMPTZ DEFAULT NOW()
     );
-    CREATE TABLE IF NOT EXISTS purchases (
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        amount INTEGER NOT NULL,
-        cashback_awarded INTEGER NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT NOW()
+    CREATE TABLE IF NOT EXISTS messages (
+        id          BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        tg_id       BIGINT REFERENCES users(tg_id) ON DELETE CASCADE,
+        text        TEXT,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
     );
     """
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql)
-        conn.commit()
-    log.info("DB migrations applied ✅")
+    with db_conn() as conn:
+        conn.execute(sql)
+    log.info("DB is ready.")
 
-def upsert_user(tg_id: int, username: Optional[str], first_name: Optional[str]) -> int:
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute(
+def upsert_user(u):
+    with db_conn() as conn:
+        conn.execute(
             """
-            INSERT INTO users (tg_id, username, first_name)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (tg_id) DO UPDATE
-            SET username=EXCLUDED.username, first_name=EXCLUDED.first_name
-            RETURNING id;
+            INSERT INTO users (tg_id, username, first_name, last_name)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (tg_id) DO UPDATE SET
+              username = EXCLUDED.username,
+              first_name = EXCLUDED.first_name,
+              last_name = EXCLUDED.last_name
             """,
-            (tg_id, username, first_name),
+            (u.id, u.username, u.first_name, u.last_name),
         )
-        uid = cur.fetchone()[0]
-        conn.commit()
-        return uid
 
-def add_purchase_for_tg(tg_id: int, amount: int) -> Tuple[int, int]:
-    cashback = round(amount * CASHBACK_PERCENT / 100.0)
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id FROM users WHERE tg_id=%s", (tg_id,))
-        r = cur.fetchone()
-        if not r:
-            raise ValueError("کاربر در دیتابیس یافت نشد. از او بخواه /start بزند.")
-        user_id = r["id"]
-        cur.execute(
-            "INSERT INTO purchases (user_id, amount, cashback_awarded) VALUES (%s,%s,%s) RETURNING id;",
-            (user_id, amount, cashback),
+def save_msg(user_id: int, text: str):
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO messages (tg_id, text) VALUES (%s, %s)",
+            (user_id, text),
         )
-        cur.execute("UPDATE users SET cashback_total=cashback_total+%s WHERE id=%s;", (cashback, user_id))
-        conn.commit()
-    return amount, cashback
-
-def get_user_summary(tg_id: int) -> Tuple[int, int]:
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, cashback_total FROM users WHERE tg_id=%s", (tg_id,))
-        u = cur.fetchone()
-        if not u:
-            return 0, 0
-        user_id, cashback_total = u["id"], int(u["cashback_total"])
-        cur.execute("SELECT COUNT(*) FROM purchases WHERE user_id=%s", (user_id,))
-        count = int(cur.fetchone()[0])
-        return cashback_total, count
-
-# ---------- Helpers ----------
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def main_menu(is_admin_flag: bool) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("👤 حساب من", callback_data="me")],
-        [InlineKeyboardButton("ℹ️ راهنما", callback_data="help")],
-    ]
-    if is_admin_flag:
-        rows.append([InlineKeyboardButton("➕ ثبت خرید (ادمین)", callback_data="admin_hint")])
-    return InlineKeyboardMarkup(rows)
 
 # ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    upsert_user(u.id, u.username, u.first_name)
-    await update.effective_message.reply_text(
-        "سلام! ربات بایو کِرِپ بار فعاله ✅",
-        reply_markup=main_menu(is_admin(u.id)),
+    user = update.effective_user
+    upsert_user(user)
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("منو", callback_data="menu")],
+        [InlineKeyboardButton("راهنما", callback_data="help")],
+    ])
+    msg = (
+        f"سلام {user.first_name} 👋\n"
+        f"به کِرِپ بار خوش اومدی!\n"
+        f"کش‌بک فعلی: {CASHBACK_PCT}%\n"
+        f"برای شروع از دکمه‌های زیر استفاده کن:"
     )
+    await update.effective_chat.send_message(msg, reply_markup=kb)
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "دستورها:\n"
-        "/start — شروع\n"
-        "/me — وضعیت من (تعداد خرید/موجودی کش‌بک)\n"
-        "/help — راهنما\n\n"
-        "ادمین:\n"
-        "/add_purchase <tg_id> <amount>\n"
-        "/stats"
+    text = (
+        "دستورات:\n"
+        "/start - شروع و ثبت نام\n"
+        "/help - راهنما\n"
+        "/id - نمایش شناسه شما\n"
     )
+    await update.effective_chat.send_message(text)
 
-async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cash, cnt = get_user_summary(update.effective_user.id)
-    await update.message.reply_text(
-        f"👤 وضعیت شما:\nتعداد خرید: {cnt}\nکیف‌پول کش‌بک: {cash} تومان"
-    )
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(f"🆔 ID شما: `{update.effective_user.id}`", parse_mode="Markdown")
 
-async def add_purchase_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔️ دسترسی مدیر لازم است.")
-        return
-    if len(context.args) != 2 or not context.args[0].isdigit() or not context.args[1].isdigit():
-        await update.message.reply_text("فرمت: /add_purchase <tg_id> <amount>")
-        return
-    tg_id, amount = int(context.args[0]), int(context.args[1])
-    try:
-        amt, cb = add_purchase_for_tg(tg_id, amount)
-        await update.message.reply_text(
-            f"✅ خرید ثبت شد.\nکاربر: {tg_id}\nمبلغ: {amt} تومان\nکش‌بک افزوده: {cb} تومان"
-        )
-    except Exception as e:
-        await update.message.reply_text(f"❗️خطا: {e}")
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("⛔️ دسترسی مدیر لازم است.")
-        return
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM users;")
-        users = int(cur.fetchone()[0])
-        cur.execute("SELECT COALESCE(SUM(amount),0), COALESCE(SUM(cashback_awarded),0) FROM purchases;")
-        total_amount, total_cashback = map(int, cur.fetchone())
-    await update.message.reply_text(
-        f"📊 آمار:\nکاربران: {users}\n"
-        f"جمع خریدها: {total_amount} تومان\n"
-        f"کش‌بک پرداخت‌شده: {total_cashback} تومان"
-    )
-
-async def on_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.data == "me":
-        cash, cnt = get_user_summary(q.from_user.id)
-        await q.edit_message_text(f"👤 وضعیت شما:\nتعداد خرید: {cnt}\nکیف‌پول کش‌بک: {cash} تومان")
+    if q.data == "menu":
+        await q.edit_message_text(
+            "منوی ساده:\n- سفارش حضوری\n- سفارش آنلاین (به‌زودی)\n- موجودی/کش‌بک (به‌زودی)"
+        )
     elif q.data == "help":
         await q.edit_message_text(
-            "راهنما:\n/start — شروع\n/me — وضعیت من\n/help — راهنما\n"
-            "ادمین: /add_purchase <tg_id> <amount> و /stats"
+            "هر سوالی داشتی همین‌جا بپرس 🌟"
         )
-    elif q.data == "admin_hint":
-        if is_admin(q.from_user.id):
-            await q.edit_message_text("ادمین عزیز: از دستور /add_purchase <tg_id> <amount> استفاده کن.")
-        else:
-            await q.edit_message_text("⛔️ این بخش فقط برای ادمین است.")
-    else:
-        await q.edit_message_text("گزینه نامعتبر.")
 
-# ---------- Bootstrap (Webhook) ----------
+async def echo_and_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    upsert_user(user)
+    txt = (update.message.text or "").strip()
+    if txt:
+        save_msg(user.id, txt)
+    await update.message.reply_text("پیامت ثبت شد ✅")
+
+# --- Admin broadcast ---
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args:
+        await update.message.reply_text("مثال: /broadcast سلام به همه")
+        return
+
+    text = " ".join(context.args)
+    sent = 0
+    with db_conn() as conn:
+        rows = conn.execute("SELECT tg_id FROM users ORDER BY joined_at DESC LIMIT 1000").fetchall()
+    for r in rows:
+        try:
+            await context.bot.send_message(r["tg_id"], text)
+            sent += 1
+        except Exception as e:
+            log.warning("broadcast to %s failed: %s", r["tg_id"], e)
+    await update.message.reply_text(f"ارسال شد برای {sent} نفر.")
+
+# ---------- Main ----------
 def main():
-    run_migrations()
+    init_db()
 
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("me", me_cmd))
-    app.add_handler(CommandHandler("add_purchase", add_purchase_cmd))
-    app.add_handler(CommandHandler("stats", stats_cmd))
-    app.add_handler(CallbackQueryHandler(on_cb))
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    url_path = f"webhook/{BOT_TOKEN}"
-    webhook_url = f"{WEBHOOK_BASE}/{url_path}"
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CommandHandler("id", id_cmd))
+    application.add_handler(CommandHandler("broadcast", broadcast))
 
-    log.info("Starting webhook @ %s on 0.0.0.0:%s", webhook_url, PORT)
-    app.run_webhook(
+    application.add_handler(CallbackQueryHandler(callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_and_log))
+
+    url_path = WEBHOOK_PATH
+    full_webhook = f"{WEBHOOK_URL}{url_path}"
+
+    log.info("Starting webhook on port %s, path=%s", PORT, url_path)
+    application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=url_path,
-        webhook_url=webhook_url,
-        secret_token=WEBHOOK_SECRET,
+        webhook_url=full_webhook,
         drop_pending_updates=True,
+        stop_signals=None,
     )
 
 if __name__ == "__main__":
