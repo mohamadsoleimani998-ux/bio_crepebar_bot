@@ -1,49 +1,79 @@
 import os
-import asyncio
 import logging
-from flask import Flask, jsonify
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import requests
+from flask import Flask, request, Response, jsonify
 
-# Logging
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
+# ---------- Config ----------
+BOT_TOKEN      = os.environ["BOT_TOKEN"].strip()
+WEBHOOK_BASE   = os.environ["WEBHOOK_BASE"].rstrip("/")
+WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"].strip()
+
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL  = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+# ---------- App ----------
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("crepebar-bot")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
+def tg_api(method: str, payload: dict) -> dict:
+    """Call Telegram Bot API (sync)."""
+    url = f"{API_BASE}/{method}"
+    r = requests.post(url, json=payload, timeout=15)
+    if not r.ok:
+        log.error("Telegram API %s failed: %s - %s", method, r.status_code, r.text)
+    return r.json() if r.text else {}
 
-# Telegram handler
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("سلام! ربات فعال است ✅")
+def set_webhook():
+    payload = {
+        "url": WEBHOOK_URL,
+        "secret_token": WEBHOOK_SECRET,
+        "drop_pending_updates": True,
+        "allowed_updates": ["message", "callback_query"]
+    }
+    res = tg_api("setWebhook", payload)
+    log.info("setWebhook -> %s", res)
 
-def build_application():
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    return app
-
-# Flask app
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
-def index():
-    return jsonify(status="ok", service="crepebar-bot")
-
-@flask_app.route("/health")
+# ---------- Routes ----------
+@app.get("/")
 def health():
-    return "OK", 200
+    return jsonify(status="ok", webhook=WEBHOOK_URL), 200
 
-# اجرای همزمان Flask و Telegram Polling
-async def run_telegram():
-    tg_app = build_application()
-    await tg_app.run_polling(drop_pending_updates=True)
+@app.post(WEBHOOK_PATH)
+def telegram_webhook():
+    # امنیت: تطبیق Secret Token
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if secret != WEBHOOK_SECRET:
+        return Response(status=401)
 
-def start_services():
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_telegram())
-    port = int(os.environ.get("PORT", 5000))
-    flask_app.run(host="0.0.0.0", port=port)
+    update = request.get_json(silent=True) or {}
+    message = update.get("message") or {}
+    text = (message.get("text") or "").strip()
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
 
-if __name__ == "__main__":
-    start_services()
+    if chat_id and text:
+        if text.startswith("/start"):
+            tg_api("sendMessage", {
+                "chat_id": chat_id,
+                "text": "سلام! 👋\nربات بیو کِرپ‌بار فعاله. از منوی پایین برای شروع استفاده کن.",
+                "parse_mode": "HTML"
+            })
+        # جا برای فیچرهای بعدی...
+
+    return Response(status=200)
+
+# ---------- Startup ----------
+# توجه: در Flask 3، before_first_request حذف شده. پس مستقیم اینجا وبهوک رو ست می‌کنیم.
+try:
+    set_webhook()
+    log.info("Webhook set to %s", WEBHOOK_URL)
+except Exception as e:
+    log.exception("Failed to set webhook: %s", e)
+
+# برای Gunicorn: متغیر app باید وجود داشته باشه
+# اگر محلی اجرا می‌کنی، می‌تونی این بلوک رو فعال کنی:
+# if __name__ == "__main__":
+#     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
