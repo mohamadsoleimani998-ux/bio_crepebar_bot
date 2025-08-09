@@ -1,89 +1,111 @@
 import os
+import threading
 import asyncio
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, abort
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, filters, ContextTypes
+)
 
-# ====== Env ======
-BOT_TOKEN       = os.environ["BOT_TOKEN"]
-WEBHOOK_BASE    = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
-WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET")  # اختیاری
-PORT            = int(os.environ.get("PORT", "10000"))  # Render هر پورتی را قبول می‌کند
+# ---------- تنظیمات از Environment ----------
+BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
+# مسیر وبهوک را ثابت می‌کنیم تا با تغییرات بعدی به ارور نخوریم
+WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
 
-# URL نهایی وبهوک: https://.../webhook/<token>
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL  = f"{WEBHOOK_BASE}{WEBHOOK_PATH}" if WEBHOOK_BASE else None
-
-# ====== Telegram application ======
-application = Application.builder().token(BOT_TOKEN).build()
-
-async def cmd_start(update: Update, _):
-    await update.message.reply_text("سلام 👋 ربات فعاله. برای تست، هر متنی بفرست تا برگردونم.")
-
-async def echo(update: Update, _):
-    if update.message:
-        await update.message.reply_text(update.message.text)
-
-application.add_handler(CommandHandler("start", cmd_start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-
-# ====== Flask app ======
+# ---------- Flask (برای Gunicorn) ----------
 app = Flask(__name__)
 
 @app.get("/")
 def health():
+    # برای Render هِلث‌چک 200 برگردانیم
     return "OK", 200
 
 @app.post(WEBHOOK_PATH)
 def telegram_webhook():
-    # اگر Secret تعریف شده، هدر تلگرام را چک کن
-    if WEBHOOK_SECRET:
-        if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
-            return Response(status=401)
+    # اعتبارسنجی توکن مخفی (optional اما توصیه‌شده)
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        abort(403)
 
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        return Response(status=400)
+    if not request.is_json:
+        abort(400)
 
-    update = Update.de_json(data, application.bot)
-    # پردازش آپدیت را به حلقه رویداد بده
-    application.create_task(application.process_update(update))
-    return Response(status=200)
+    update_json = request.get_json(force=True)
 
-# ====== lifecycle: initialize/start و setWebhook یک‌بار ======
-_app_started = False
-async def _startup_once():
-    global _app_started
-    if _app_started:
-        return
-    await application.initialize()
-    await application.start()
-    # ست کردن وبهوک روی مسیر ثابت (idempotent)
-    if WEBHOOK_URL:
+    # Update را ایمن از ترد Flask به لوپ بات پاس بدهیم
+    update = Update.de_json(update_json, application.bot)  # type: ignore
+    asyncio.run_coroutine_threadsafe(
+        application.update_queue.put(update), bot_loop
+    )
+    return "OK", 200
+
+# ---------- Telegram Bot (python-telegram-bot v20) ----------
+application: Application
+bot_loop: asyncio.AbstractEventLoop
+
+# هندلرها
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    name = update.effective_user.first_name if update.effective_user else "دوست عزیز"
+    text = (
+        f"سلام {name} 👋\n"
+        "ربات فعاله. برای تست، هر متنی بفرست تا برگردونم."
+    )
+    await update.message.reply_text(text)  # type: ignore
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message and update.message.text:
+        await update.message.reply_text(update.message.text)
+
+def build_application() -> Application:
+    app_ = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app_.add_handler(CommandHandler("start", cmd_start))
+    app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+    return app_
+
+# اجرای امنِ PTB در یک تردِ جدا با event loop اختصاصی
+def start_bot_worker():
+    global application, bot_loop
+
+    bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(bot_loop)
+
+    application = build_application()
+
+    async def runner():
+        # initialize/start و ست‌کردن وبهوک روی URL پایدار
+        await application.initialize()
+        await application.start()
+
+        full_webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
+        # drop_pending_updates=True برای جلوگیری از سیل پیام‌های قدیمی
         await application.bot.set_webhook(
-            url=WEBHOOK_URL,
-            secret_token=WEBHOOK_SECRET  # اگر None باشد تلگرام هدر نمی‌فرستد
+            url=full_webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
         )
-    _app_started = True
 
-# در اولین درخواست یا اولین import، app را بالا بیاور
-# (Flask 3 دیگر before_first_request ندارد؛ این روش امن است)
-@app.before_request
-def ensure_started():
-    if not _app_started:
-        asyncio.get_event_loop().create_task(_startup_once())
+        # آماده پردازش آپدیت‌هایی که از Flask می‌رسند
+        # application.start() صف را مصرف می‌کند، فقط لوپ را زنده نگه داریم
+        # (run_forever در بیرون صدا زده می‌شود)
+        return
 
-# خروج تمیز (برای ری‌دیپلوی‌های Render)
-@app.route("/shutdown-hook", methods=["POST"])
-def shutdown_hook():
-    try:
-        asyncio.get_event_loop().create_task(application.stop())
-        asyncio.get_event_loop().create_task(application.shutdown())
-    finally:
-        return jsonify(ok=True)
+    bot_loop.create_task(runner())
+    bot_loop.run_forever()
 
-# برای Gunicorn: bot:app
-if __name__ == "__main__":
-    # اجرای لوکال
-    asyncio.get_event_loop().create_task(_startup_once())
-    app.run(host="0.0.0.0", port=PORT)
+# تردِ بات را در زمان import بالا می‌آوریم (با gunicorn سازگار)
+_bot_thread = threading.Thread(target=start_bot_worker, daemon=True, name="ptb-worker")
+_bot_thread.start()
+
+# شات‌داون تمیز هنگام خاموش‌شدن پاد
+def _shutdown():
+    if "application" in globals():
+        fut = asyncio.run_coroutine_threadsafe(application.stop(), bot_loop)
+        try:
+            fut.result(timeout=5)
+        except Exception:
+            pass
+        bot_loop.call_soon_threadsafe(bot_loop.stop)
+
+import atexit
+atexit.register(_shutdown)
