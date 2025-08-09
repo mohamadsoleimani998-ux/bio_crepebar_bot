@@ -1,36 +1,29 @@
 import os
-import threading
 import asyncio
 import logging
 from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ===== Logging =====
+# Logging
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("crepebar-bot")
 
-# ===== Config =====
-BOT_TOKEN = os.environ["BOT_TOKEN"]  # توی Environment از قبل داری
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-# ===== Handlers =====
+# Telegram handler
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("سلام! ربات فعال است ✅")
 
-def build_application() -> Application:
+def build_application():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     return app
 
-# ===== Polling runner (background thread) =====
-def run_polling():
-    application = build_application()
-    asyncio.run(application.run_polling(drop_pending_updates=True))
-
-# ===== Flask app (stays alive for Render) =====
+# Flask app
 app = Flask(__name__)
 
 @app.route("/")
@@ -41,6 +34,14 @@ def index():
 def health():
     return "OK", 200
 
-# Start Telegram polling in background
-threading.Thread(target=run_polling, daemon=True).start()
-log.info("Background polling started.")
+# Run Telegram polling in same event loop
+@app.before_first_request
+def activate_bot():
+    loop = asyncio.get_event_loop()
+    tg_app = build_application()
+    loop.create_task(tg_app.run_polling(drop_pending_updates=True))
+    log.info("Telegram polling started.")
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
