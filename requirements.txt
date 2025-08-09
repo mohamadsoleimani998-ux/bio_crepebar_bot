@@ -1,4 +1,4 @@
-python-telegram-bot==20.3
-Flask
-psycopg2-binary
+python-telegram-bot[webhooks]==20.7
+flask
 gunicorn
+psycopg2-binary==2.9.9
