@@ -1,87 +1,112 @@
-# --- Debug-friendly bot.py (safe to drop-in) ---
-import os, sys, traceback, logging
-from datetime import datetime
+# bot.py
+import os
+import sys
+import threading
+import logging
+from flask import Flask
 
-# لاگ‌گیری واضح روی stdout (Render دقیقاً همین رو نشان می‌دهد)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
+)
+
+# =========================
+# Environment (لازم)
+# =========================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN is missing in Environment", file=sys.stderr)
+    sys.exit(1)
+
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.isdigit()
+}
+CASHBACK_PERCENT = int(os.getenv("CASHBACK_PERCENT", "3"))
+
+# =========================
+# Logging
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
-log = logging.getLogger("bio-crepebar-bot")
+log = logging.getLogger("crepebar-bot")
 
-def _safe(val, keep=4):
-    """برای جلوگیری از نمایش کامل مقادیر حساس در لاگ"""
-    if not val:
-        return "<empty>"
-    return f"{val[:keep]}...{val[-keep:]}" if len(val) > keep*2 else "***"
+# =========================
+# Telegram Bot (PTB v20+)
+# =========================
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("منو", callback_data="menu")],
+        [InlineKeyboardButton("راهنما", callback_data="help")]
+    ])
 
-def print_boot_info():
-    log.info("==== Booting bot ====")
-    log.info("Python: %s", sys.version.split()[0])
-    log.info("TZ: %s", os.environ.get("TZ", "not-set"))
-    log.info("ENV keys: %s", ", ".join(sorted(os.environ.keys())))
-    log.info("BOT_TOKEN: %s", _safe(os.environ.get("BOT_TOKEN")))
-    log.info("WEBHOOK_BASE: %s", os.environ.get("WEBHOOK_BASE", "<unset>"))
-    log.info("DATABASE_URL set? %s", bool(os.environ.get("DATABASE_URL")))
-    log.info("Cashback: %s", os.environ.get("CASHBACK_PERCENT", "<unset>"))
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    msg = (
+        f"سلام {u.first_name} 👋\n"
+        f"به بیو کِرِپ بار خوش اومدی!\n"
+        f"کش‌بک فعلی: {CASHBACK_PERCENT}%\n"
+        f"از دکمه‌های زیر استفاده کن:"
+    )
+    await update.effective_chat.send_message(msg, reply_markup=main_menu())
 
-# ====== از اینجا کد تلگرام شما ======
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message("دستورات:\n/start — شروع\n/help — راهنما")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]  # اگر ست نباشد KeyError می‌دهد و پایین try/except می‌گیریمش
+async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "menu":
+        await q.edit_message_text("منو نمونه:\n• کرپ نوتلا — ۱۹۰\n• کرپ موز-نوتلا — ۲۲۰")
+    elif q.data == "help":
+        await q.edit_message_text("هر سوالی داشتی همینجا بپرس 🌟")
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ربات فعال است ✅")
+async def echo_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # پاسخ کوتاه برای تست
+    await update.message.reply_text("پیامت ثبت شد ✅")
 
-def build_app() -> Application:
+def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
+    # Commands
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    # Buttons
+    app.add_handler(CallbackQueryHandler(cb_handler))
+    # Text fallback
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_text))
     return app
-# ====== پایان بخش اصلی ربات ======
 
-async def _run():
+def run_bot_polling():
     """
-    اگر WEBHOOK_BASE ست باشد، همون webhook فعلی را می‌گذاریم.
-    اگر نبود، می‌رویم سراغ polling. (رفتار را خراب نمی‌کند—فقط طبق ENV تصمیم می‌گیرد)
+    اجرای بلاکینگِ PTB داخل ترد پس‌زمینه.
+    این کار باعث می‌شود پروسه‌ی Flask (gunicorn) زنده بماند
+    و خطاهای event loop / pending task رخ ندهد.
     """
-    print_boot_info()
-    app = build_app()
-
-    webhook_base = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
-    secret_token = os.environ.get("WEBHOOK_SECRET", "crepe-secret")
-
-    if webhook_base:
-        # همان مسیری که داشتیم
-        path = f"/webhook/{secret_token}"
-        full = f"{webhook_base}{path}"
-        log.info("Starting in WEBHOOK mode → %s", full)
-        await app.bot.set_webhook(url=full, secret_token=secret_token)
-        # run_webhook بدون Flask (PTB v20) → Render فقط به پورت نیاز ندارد
-        await app.run_webhook(
-            listen="0.0.0.0",
-            port=int(os.environ.get("PORT", "10000")),
-            webhook_url=full,
-            secret_token=secret_token
-        )
-    else:
-        log.info("Starting in POLLING mode")
-        await app.run_polling(allowed_updates=None, close_loop=False)
-
-if __name__ == "__main__":
     try:
-        import asyncio
-        log.info("Process started at %s", datetime.utcnow().isoformat() + "Z")
-        asyncio.run(_run())
-    except KeyError as e:
-        # معمول‌ترین خطا: نبودن یک ENV (مثل WEBHOOK_BASE یا BOT_TOKEN)
-        log.error("ENV missing: %s", e)
-        log.error("Tip: مقدار %s را در Environment ست کن.", str(e))
-        traceback.print_exc()
-        sys.exit(1)
+        application = build_application()
+        application.run_polling(
+            drop_pending_updates=True,
+            read_timeout=30,
+            write_timeout=30,
+            connect_timeout=30,
+            pool_timeout=30,
+            allowed_updates=None,
+        )
     except Exception as e:
-        # هر خطای غیرمنتظره را کامل لاگ کن تا در Render ببینیم
-        log.exception("Fatal error in main: %s", e)
-        traceback.print_exc()
-        sys.exit(1)
+        log.exception("Bot crashed: %s", e)
+
+# ترد پس‌زمینه را استارت می‌کنیم تا همزمان با وب‌سرور اجرا شود
+_bot_thread = threading.Thread(target=run_bot_polling, name="tg-bot", daemon=True)
+_bot_thread.start()
+
+# =========================
+# Flask app (برای Render / health)
+# =========================
+app = Flask(__name__)
+
+@app.get("/")
+def health():
+    return "OK", 200
