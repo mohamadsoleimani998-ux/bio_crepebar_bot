@@ -1,111 +1,139 @@
 import os
 import threading
 import asyncio
+import logging
+import json
+from typing import List
+
+import requests
 from flask import Flask, request, abort
+
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters, ContextTypes
+    Application,
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
 )
 
-# ---------- تنظیمات از Environment ----------
-BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
-WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE", "").rstrip("/")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
-# مسیر وبهوک را ثابت می‌کنیم تا با تغییرات بعدی به ارور نخوریم
-WEBHOOK_PATH = f"/webhook/{WEBHOOK_SECRET}"
+# ------------------ Config & Logging ------------------
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("crepebar-bot")
 
-# ---------- Flask (برای Gunicorn) ----------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+WEBHOOK_BASE = os.environ.get("WEBHOOK_BASE") or os.environ.get("WEBHOOK_URL")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
+
+# برای راحتی، ادمین‌ها اختیاری است
+def _parse_admin_ids(v: str) -> List[int]:
+    try:
+        return [int(x.strip()) for x in v.split(",") if x.strip()]
+    except Exception:
+        return []
+
+ADMIN_IDS = _parse_admin_ids(os.environ.get("ADMIN_IDS", ""))
+
+# ------------------ Telegram App ------------------
+application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    text = "سلام 👋\nربات فعاله. برای تست، هر متنی بفرست تا برگردونم."
+    await update.effective_message.reply_text(text)
+
+# یک echo ساده برای تست
+async def echo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message and update.message.text:
+        await update.message.reply_text(update.message.text)
+
+application.add_handler(CommandHandler("start", start_cmd))
+# handler ساده برای هر پیام متنی
+from telegram.ext import MessageHandler, filters
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+# ------------------ Async loop in background ------------------
+# نکته‌ی کلیدی: لوپ مستقل می‌سازیم و داخل یک ترد اجرا می‌کنیم تا
+# از ارور «There is no current event loop in thread …» جلوگیری شود.
+_loop = asyncio.new_event_loop()
+
+def _run_app_loop():
+    asyncio.set_event_loop(_loop)
+    _loop.run_until_complete(application.initialize())
+    _loop.run_until_complete(application.start())
+    log.info("telegram application started")
+    _loop.run_forever()
+
+_bg = threading.Thread(target=_run_app_loop, name="tg-app-loop", daemon=True)
+_bg.start()
+
+# ------------------ Webhook setup ------------------
+def _set_webhook_once():
+    """
+    وبهوک را با آدرس ثابت ست می‌کند. این تابع سنکرون است و ساختار فعلی را به‌هم نمی‌زند.
+    """
+    if not WEBHOOK_BASE:
+        log.warning("WEBHOOK_BASE/WEBHOOK_URL is not set; webhook not configured.")
+        return
+    base = WEBHOOK_BASE.rstrip("/")
+    hook_url = f"{base}/{BOT_TOKEN}/{WEBHOOK_SECRET}"
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook",
+            data={
+                "url": hook_url,
+                "secret_token": WEBHOOK_SECRET,
+                "drop_pending_updates": "true",
+            },
+            timeout=10,
+        )
+        ok = False
+        try:
+            j = resp.json()
+            ok = j.get("ok", False)
+            log.info("setWebhook response: %s", j)
+        except Exception:
+            log.info("setWebhook status=%s, body=%s", resp.status_code, resp.text[:200])
+        if not ok:
+            log.warning("setWebhook may not be ok; check token/url/secret.")
+    except Exception as e:
+        log.exception("failed to set webhook: %s", e)
+
+_set_webhook_once()
+
+# ------------------ Flask (health + webhook endpoint) ------------------
 app = Flask(__name__)
 
 @app.get("/")
 def health():
-    # برای Render هِلث‌چک 200 برگردانیم
+    # برای هلت‌چک Render
     return "OK", 200
 
-@app.post(WEBHOOK_PATH)
+@app.post(f"/{BOT_TOKEN}/{WEBHOOK_SECRET}")
 def telegram_webhook():
-    # اعتبارسنجی توکن مخفی (optional اما توصیه‌شده)
+    # ولیدیشن سکرت هدر (اختیاری ولی امن‌تر)
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         abort(403)
 
-    if not request.is_json:
-        abort(400)
+    try:
+        data = request.get_json(force=True, silent=False)
+        update = Update.de_json(data, application.bot)
+        # IMPORTANT: چون در ترد Flask هستیم، باید از run_coroutine_threadsafe استفاده کنیم
+        fut = asyncio.run_coroutine_threadsafe(
+            application.update_queue.put(update), _loop
+        )
+        fut.result(timeout=5)  # خطایی بود همان‌جا بگیرد
+    except Exception as e:
+        log.exception("webhook error: %s", e)
+        return "ERROR", 500
 
-    update_json = request.get_json(force=True)
-
-    # Update را ایمن از ترد Flask به لوپ بات پاس بدهیم
-    update = Update.de_json(update_json, application.bot)  # type: ignore
-    asyncio.run_coroutine_threadsafe(
-        application.update_queue.put(update), bot_loop
-    )
     return "OK", 200
 
-# ---------- Telegram Bot (python-telegram-bot v20) ----------
-application: Application
-bot_loop: asyncio.AbstractEventLoop
-
-# هندلرها
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    name = update.effective_user.first_name if update.effective_user else "دوست عزیز"
-    text = (
-        f"سلام {name} 👋\n"
-        "ربات فعاله. برای تست، هر متنی بفرست تا برگردونم."
-    )
-    await update.message.reply_text(text)  # type: ignore
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message and update.message.text:
-        await update.message.reply_text(update.message.text)
-
-def build_application() -> Application:
-    app_ = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
-    app_.add_handler(CommandHandler("start", cmd_start))
-    app_.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
-    return app_
-
-# اجرای امنِ PTB در یک تردِ جدا با event loop اختصاصی
-def start_bot_worker():
-    global application, bot_loop
-
-    bot_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(bot_loop)
-
-    application = build_application()
-
-    async def runner():
-        # initialize/start و ست‌کردن وبهوک روی URL پایدار
-        await application.initialize()
-        await application.start()
-
-        full_webhook_url = f"{WEBHOOK_BASE}{WEBHOOK_PATH}"
-        # drop_pending_updates=True برای جلوگیری از سیل پیام‌های قدیمی
-        await application.bot.set_webhook(
-            url=full_webhook_url,
-            secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True,
-        )
-
-        # آماده پردازش آپدیت‌هایی که از Flask می‌رسند
-        # application.start() صف را مصرف می‌کند، فقط لوپ را زنده نگه داریم
-        # (run_forever در بیرون صدا زده می‌شود)
-        return
-
-    bot_loop.create_task(runner())
-    bot_loop.run_forever()
-
-# تردِ بات را در زمان import بالا می‌آوریم (با gunicorn سازگار)
-_bot_thread = threading.Thread(target=start_bot_worker, daemon=True, name="ptb-worker")
-_bot_thread.start()
-
-# شات‌داون تمیز هنگام خاموش‌شدن پاد
-def _shutdown():
-    if "application" in globals():
-        fut = asyncio.run_coroutine_threadsafe(application.stop(), bot_loop)
-        try:
-            fut.result(timeout=5)
-        except Exception:
-            pass
-        bot_loop.call_soon_threadsafe(bot_loop.stop)
-
-import atexit
-atexit.register(_shutdown)
+# ------------------ gunicorn entry ------------------
+# Procfile شما:  web: gunicorn bot:app
+# بنابراین نیازی به __main__ نیست؛ ولی برای اجرای لوکال می‌گذاریم:
+if __name__ == "__main__":
+    # اجرای لوکال (در Render gunicorn اجرا می‌کند)
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
