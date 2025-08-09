@@ -1,112 +1,104 @@
-# bot.py
 import os
-import sys
-import threading
 import logging
-from flask import Flask
+import signal
+import threading
+import asyncio
+from flask import Flask, jsonify
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters
-)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# =========================
-# Environment (لازم)
-# =========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-if not BOT_TOKEN:
-    print("ERROR: BOT_TOKEN is missing in Environment", file=sys.stderr)
-    sys.exit(1)
-
-ADMIN_IDS = {
-    int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.isdigit()
-}
-CASHBACK_PERCENT = int(os.getenv("CASHBACK_PERCENT", "3"))
-
-# =========================
-# Logging
-# =========================
+# -------------------- Logging --------------------
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)],
+    level=logging.INFO,
 )
 log = logging.getLogger("crepebar-bot")
 
-# =========================
-# Telegram Bot (PTB v20+)
-# =========================
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("منو", callback_data="menu")],
-        [InlineKeyboardButton("راهنما", callback_data="help")]
-    ])
+# -------------------- Config --------------------
+# فقط از همین توکن استفاده می‌کنیم (Environment را تغییر نده)
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    msg = (
-        f"سلام {u.first_name} 👋\n"
-        f"به بیو کِرِپ بار خوش اومدی!\n"
-        f"کش‌بک فعلی: {CASHBACK_PERCENT}%\n"
-        f"از دکمه‌های زیر استفاده کن:"
+# -------------------- Telegram Handlers --------------------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """پاسخ ساده برای اطمینان از کارکرد ربات"""
+    text = (
+        "سلام! 👋\n"
+        "ربات فعال است. این پیام تست است تا مطمئن شویم دیپلوی سالمه.\n"
+        "می‌تونم بعداً منو/سفارش و ... رو هم اضافه کنم."
     )
-    await update.effective_chat.send_message(msg, reply_markup=main_menu())
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message("دستورات:\n/start — شروع\n/help — راهنما")
-
-async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data == "menu":
-        await q.edit_message_text("منو نمونه:\n• کرپ نوتلا — ۱۹۰\n• کرپ موز-نوتلا — ۲۲۰")
-    elif q.data == "help":
-        await q.edit_message_text("هر سوالی داشتی همینجا بپرس 🌟")
-
-async def echo_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # پاسخ کوتاه برای تست
-    await update.message.reply_text("پیامت ثبت شد ✅")
+    await update.message.reply_text(text)
 
 def build_application() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
-    # Commands
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    # Buttons
-    app.add_handler(CallbackQueryHandler(cb_handler))
-    # Text fallback
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_text))
+    app.add_handler(CommandHandler("start", start_cmd))
     return app
 
-def run_bot_polling():
+# -------------------- Polling in background --------------------
+_stop_event = threading.Event()
+_tg_thread: threading.Thread | None = None
+
+def _run_polling_bg(app: Application) -> None:
     """
-    اجرای بلاکینگِ PTB داخل ترد پس‌زمینه.
-    این کار باعث می‌شود پروسه‌ی Flask (gunicorn) زنده بماند
-    و خطاهای event loop / pending task رخ ندهد.
+    اجرای تمیز polling در یک event loop مخصوص thread
+    تا بتوانیم shutdown بدون warning داشته باشیم.
     """
+    async def _main():
+        await app.initialize()
+        await app.start()
+        # در PTB v20، Updater به صورت داخلی ساخته می‌شود:
+        await app.updater.start_polling(drop_pending_updates=True)
+        log.info("Telegram polling started.")
+        # صبر تا سیگنال توقف
+        while not _stop_event.is_set():
+            await asyncio.sleep(0.5)
+        # توقف تمیز
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        log.info("Telegram polling stopped cleanly.")
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        application = build_application()
-        application.run_polling(
-            drop_pending_updates=True,
-            read_timeout=30,
-            write_timeout=30,
-            connect_timeout=30,
-            pool_timeout=30,
-            allowed_updates=None,
+        loop.run_until_complete(_main())
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+def start_polling_once() -> None:
+    global _tg_thread
+    if _tg_thread is not None and _tg_thread.is_alive():
+        return
+    application = build_application()
+    _tg_thread = threading.Thread(
+        target=_run_polling_bg, args=(application,), name="telegram-polling", daemon=True
         )
-    except Exception as e:
-        log.exception("Bot crashed: %s", e)
+    _tg_thread.start()
+    log.info("Background polling thread started.")
 
-# ترد پس‌زمینه را استارت می‌کنیم تا همزمان با وب‌سرور اجرا شود
-_bot_thread = threading.Thread(target=run_bot_polling, name="tg-bot", daemon=True)
-_bot_thread.start()
+def _handle_sigterm(*_):
+    # سیگنال توقف از Render/Gunicorn
+    log.info("SIGTERM received. Stopping polling ...")
+    _stop_event.set()
 
-# =========================
-# Flask app (برای Render / health)
-# =========================
+# سیگنال‌ها برای خاموشی تمیز
+signal.signal(signal.SIGTERM, _handle_sigterm)
+try:
+    signal.signal(signal.SIGINT, _handle_sigterm)
+except Exception:
+    pass
+
+# -------------------- Flask HTTP (health) --------------------
 app = Flask(__name__)
 
 @app.get("/")
+def root():
+    return jsonify(status="ok", service="bio-crepebar-bot"), 200
+
+@app.get("/health")
 def health():
     return "OK", 200
+
+# وقتی ماژول لود شد (در gunicorn)، polling را یک بار روشن کن
+start_polling_once()
