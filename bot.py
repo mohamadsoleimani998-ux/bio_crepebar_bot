@@ -1,53 +1,54 @@
 import os
 import logging
 import asyncio
-from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.error import RetryAfter
 
+# -------- Logging
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("crepebar-bot")
 
+# -------- Env
 TOKEN = os.getenv("BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
 if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+    raise RuntimeError("BOT_TOKEN env var is missing")
 if not WEBHOOK_URL:
-    raise RuntimeError("WEBHOOK_URL is not set")
+    raise RuntimeError("WEBHOOK_URL env var is missing")
 
+# -------- Handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("سلام 👋 ربات فروشگاه کرپ‌بار فعال شد ✅")
+    await update.message.reply_text("سلام 👋 ربات کرپ‌بار فعاله ✅")
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("دستورات موجود:\n/start - شروع\n/help - راهنما")
+    await update.message.reply_text("دستورات:\n/start\n/help")
 
+# -------- Main
 async def main():
     app = Application.builder().token(TOKEN).build()
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
 
+    # تلاش برای ست‌کردن وبهوک (اگر چندبار پشت‌سرهم صدا شد، Flood کنترل می‌شود)
     try:
-        await app.bot.set_webhook(url=WEBHOOK_URL)
-        log.info("Webhook set successfully ✅")
+        await app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+        log.info("Webhook set ✅ -> %s", WEBHOOK_URL)
     except RetryAfter as e:
-        log.warning(f"Flood control: retry after {e.retry_after} seconds. Skipping set_webhook.")
+        log.warning("Flood control: retry after %s sec. ادامه بدون set_webhook مجدد.", e.retry_after)
 
+    # روی پورتی که Render می‌دهد گوش می‌کنیم
     await app.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 8443)),
-        url_path="",
-        webhook_url=WEBHOOK_URL
+        url_path="",            # چون WEBHOOK_URL کامل است
+        webhook_url=WEBHOOK_URL # آدرس کامل وبهوک
     )
 
 if __name__ == "__main__":
-    try:
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(main())
-    except RuntimeError:
-        new_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(new_loop)
-        new_loop.run_until_complete(main())
+    asyncio.run(main())
