@@ -24,24 +24,26 @@ def build_application():
     return app
 
 # Flask app
-app = Flask(__name__)
+flask_app = Flask(__name__)
 
-@app.route("/")
+@flask_app.route("/")
 def index():
     return jsonify(status="ok", service="crepebar-bot")
 
-@app.route("/health")
+@flask_app.route("/health")
 def health():
     return "OK", 200
 
-# Run Telegram polling in same event loop
-@app.before_first_request
-def activate_bot():
-    loop = asyncio.get_event_loop()
+# اجرای همزمان Flask و Telegram Polling
+async def run_telegram():
     tg_app = build_application()
-    loop.create_task(tg_app.run_polling(drop_pending_updates=True))
-    log.info("Telegram polling started.")
+    await tg_app.run_polling(drop_pending_updates=True)
+
+def start_services():
+    loop = asyncio.get_event_loop()
+    loop.create_task(run_telegram())
+    port = int(os.environ.get("PORT", 5000))
+    flask_app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    start_services()
