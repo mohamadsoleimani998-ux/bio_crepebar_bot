@@ -1,12 +1,10 @@
-import os
-import json
 from fastapi import FastAPI, Request
-from handlers import handle_update
+from src.handlers import handle_update
 
 app = FastAPI()
 
-@app.post(f"/{os.getenv('BOT_TOKEN')}")
-async def webhook(request: Request):
+@app.post("/{token}")
+async def webhook(request: Request, token: str):
     update = await request.json()
     await handle_update(update)
     return {"ok": True}
