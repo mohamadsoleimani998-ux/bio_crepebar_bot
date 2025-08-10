@@ -1,49 +1,51 @@
 import os
-import httpx
 from fastapi import FastAPI, Request
-from .handlers import handle_update
+from fastapi.responses import JSONResponse
+import requests
 
-TOKEN = os.getenv("BOT_TOKEN", "")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+from .db import ensure_schema, get_or_create_user, get_products
+
+# --- هنگام استارت، اسکیمای دیتابیس تضمین می‌شود
+ensure_schema()
+
+TOKEN = os.getenv("BOT_TOKEN")
+BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
 
 app = FastAPI()
 
-@app.on_event("startup")
-async def on_startup():
-    # در صورت تنظیم PUBLIC_URL، وبهوک را روی /webhook ست می‌کنیم
-    if TOKEN and PUBLIC_URL:
-        url = f"{PUBLIC_URL}/webhook"
-        try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(
-                    f"https://api.telegram.org/bot{TOKEN}/setWebhook",
-                    params={"url": url}
-                )
-                print("setWebhook:", r.text)
-        except Exception as e:
-            # اگر ست نشد هم سرویس بالا می‌آید
-            print("setWebhook error:", e)
+# ------------------ متد ارسال پیام ------------------
+def send_message(chat_id, text):
+    url = f"{BASE_URL}/sendMessage"
+    requests.post(url, json={"chat_id": chat_id, "text": text})
 
+# ------------------ وبهوک ------------------
 @app.post("/webhook")
 async def webhook(request: Request):
-    try:
-        update = await request.json()
-    except Exception:
-        update = {}
-    await handle_update(update)
-    return {"ok": True}
+    data = await request.json()
+    message = data.get("message") or {}
+    chat_id = message.get("chat", {}).get("id")
+    text = message.get("text")
 
-# سازگاری با مسیر قدیمی اگر قبلاً وبهوک روی /<TOKEN> بوده
-if TOKEN:
-    @app.post(f"/{TOKEN}")
-    async def webhook_token(request: Request):
-        try:
-            update = await request.json()
-        except Exception:
-            update = {}
-        await handle_update(update)
-        return {"ok": True}
+    if not chat_id or not text:
+        return JSONResponse({"ok": True})
 
-@app.get("/")
-async def root():
-    return {"status": "ok"}
+    # ثبت یا گرفتن کاربر
+    get_or_create_user(chat_id)
+
+    # دستورات
+    if text.startswith("/start"):
+        send_message(chat_id, "سلام! به ربات خوش آمدید.\nدستورات: /wallet , /products")
+    elif text.startswith("/wallet"):
+        user = get_or_create_user(chat_id)
+        send_message(chat_id, f"موجودی کیف پول: {user['wallet_cents']} تومان")
+    elif text.startswith("/products"):
+        products = get_products()
+        if not products:
+            send_message(chat_id, "محصولی موجود نیست.")
+        else:
+            for p in products:
+                send_message(chat_id, f"{p['title']} - قیمت: {p['price_cents']} تومان")
+    else:
+        send_message(chat_id, "دستور ناشناخته.")
+
+    return JSONResponse({"ok": True})
