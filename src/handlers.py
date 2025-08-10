@@ -1,137 +1,106 @@
 import os
-import logging
+import re
 import requests
-from typing import Any, Dict, Optional
+
+from db import init_db, get_or_create_user, get_wallet, update_wallet, list_products, add_product
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x]
+CASHBACK_PERCENT = int(os.getenv("CASHBACK_PERCENT", "5") or "5")
 
-# ارسال پیام
-def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
-    try:
-        payload = {"chat_id": chat_id, "text": text}
-        if reply_markup:
-            payload["reply_markup"] = reply_markup
-        requests.post(f"{API_BASE}/sendMessage", json=payload, timeout=10)
-    except Exception as e:
-        logging.exception("send_message error: %s", e)
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# چک کردن ادمین بودن
-def is_admin(user_id: int) -> bool:
-    raw = os.getenv("ADMIN_IDS", "")
-    if not raw:
-        return False
+def _send_text(chat_id: int, text: str, parse_mode: str | None = None):
+    payload = {"chat_id": chat_id, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
-        return str(user_id) in [s.strip() for s in raw.split(",") if s.strip()]
+        requests.post(f"{API}/sendMessage", json=payload, timeout=10)
     except Exception:
-        return False
+        pass
 
-# ایمپورت امن دیتابیس
-def _db():
+def _send_photo(chat_id: int, file_id: str, caption: str | None = None):
+    payload = {"chat_id": chat_id, "photo": file_id}
+    if caption:
+        payload["caption"] = caption
     try:
-        from src import db  # type: ignore
-        return db
-    except Exception as e:
-        logging.warning("db module not ready: %s", e)
-        return None
+        requests.post(f"{API}/sendPhoto", json=payload, timeout=10)
+    except Exception:
+        pass
 
-# هندل آپدیت
-async def handle_update(update: Dict[str, Any]):
+
+async def handle_update(update: dict):
+    """
+    حداقل‌های پایدار:
+    - /start : ساخت کاربر + راهنما
+    - /wallet : نمایش موجودی (تومان)
+    - /products : لیست محصولات (اگر عکس دارد با عکس، وگرنه متن)
+    - ادمین: ارسال Photo با کپشن «عنوان | قیمت_تومان» -> ثبت محصول
+    """
     try:
-        message = update.get("message") or update.get("edited_message")
-        if not message:
+        msg = update.get("message") or update.get("edited_message")
+        if not msg:
             return
 
-        chat_id = message["chat"]["id"]
-        text = (message.get("text") or "").strip()
-        user_id = message.get("from", {}).get("id")
+        chat = msg.get("chat", {})
+        chat_id = int(chat.get("id"))
+        from_user = msg.get("from", {}) or {}
+        tg_id = int(from_user.get("id"))
 
-        # /start
+        is_admin = tg_id in ADMIN_IDS
+        # ایجاد/خواندن کاربر
+        get_or_create_user(tg_id, is_admin=is_admin)
+
+        text = msg.get("text") or ""
+        photo = msg.get("photo")
+
+        # --- Commands ---
         if text.startswith("/start"):
-            send_message(
+            _send_text(
                 chat_id,
                 "سلام! به ربات خوش آمدید.\n"
-                "دستورات: /products ، /wallet\n"
-                "اگر ادمین هستید، برای افزودن محصول یک عکس با کپشن بفرستید."
+                "دستورات: /wallet , /products\n"
+                "اگر ادمین هستید، برای افزودن محصول یک عکس با کپشن بفرستید.\n"
+                "فرمت کپشن: عنوان | قیمت_تومان",
             )
             return
 
-        # /products
-        if text.startswith("/products"):
-            db = _db()
-            if db and hasattr(db, "list_products"):
-                try:
-                    items = db.list_products()
-                    if not items:
-                        send_message(chat_id, "هنوز محصولی ثبت نشده است.")
-                        return
-
-                    lines = []
-                    for p in items:
-                        pid, title, price_cents, desc, _photo = p
-                        price = (price_cents or 0) / 100
-                        lines.append(f"#{pid} — {title} — {price:.0f} تومان\n{desc or ''}")
-                    send_message(chat_id, "\n\n".join(lines))
-                except Exception as e:
-                    logging.exception("list_products error: %s", e)
-                    send_message(chat_id, "خطا در دریافت لیست محصولات.")
-            else:
-                send_message(chat_id, "ماژول دیتابیس یا تابع محصولات آماده نیست.")
-            return
-
-        # /wallet
         if text.startswith("/wallet"):
-            db = _db()
-            try:
-                if db and hasattr(db, "get_wallet"):
-                    cents = db.get_wallet(user_id)
-                    tomans = (cents or 0) / 100
-                    send_message(chat_id, f"موجودی کیف پول شما: {tomans:.0f} تومان")
-                elif db and hasattr(db, "get_or_create_user"):
-                    u = db.get_or_create_user(user_id)
-                    wallet_cents = None
-                    if isinstance(u, dict):
-                        wallet_cents = u.get("wallet_cents")
-                    elif isinstance(u, (list, tuple)) and len(u) >= 2:
-                        wallet_cents = u[1]
-                    tomans = (wallet_cents or 0) / 100
-                    send_message(chat_id, f"موجودی کیف پول شما: {tomans:.0f} تومان")
+            cents = get_wallet(tg_id)
+            toman = cents // 100
+            _send_text(chat_id, f"موجودی کیف پول شما: {toman} تومان")
+            return
+
+        if text.startswith("/products"):
+            items = list_products()
+            if not items:
+                _send_text(chat_id, "هنوز محصولی ثبت نشده است.")
+                return
+            for it in items[:20]:
+                cap = f"{it['title']} - قیمت: {it['price_cents']//100} تومان"
+                if it.get("image_file_id"):
+                    _send_photo(chat_id, it["image_file_id"], cap)
                 else:
-                    send_message(chat_id, "کیف پول هنوز فعال نشده است.")
-            except Exception as e:
-                logging.exception("wallet error: %s", e)
-                send_message(chat_id, "خطا در دریافت کیف پول.")
+                    _send_text(chat_id, cap)
             return
 
-        # افزودن محصول با عکس
-        if "photo" in message and is_admin(user_id):
-            caption = (message.get("caption") or "").strip()
-            photos = message.get("photo") or []
-            if not photos:
+        # --- Admin: add product via photo + caption ---
+        if is_admin and photo:
+            caption = msg.get("caption") or ""
+            # الگو: عنوان | قیمت_تومان
+            m = re.match(r"(.+?)\s*\|\s*(\d+)", caption)
+            if not m:
+                _send_text(chat_id, "فرمت کپشن معتبر نیست. مثال: «کراپ نوتلا | 85000»")
                 return
-            file_id = photos[-1]["file_id"]
-
-            try:
-                title, price_toman, *rest = [s.strip() for s in caption.split("|")]
-                description = rest[0] if rest else ""
-                price_cents = int(float(price_toman)) * 100
-            except Exception:
-                send_message(chat_id, "فرمت کپشن صحیح نیست. مثال:\nعنوان | قیمت_به_تومان | توضیح")
-                return
-
-            db = _db()
-            if db and hasattr(db, "add_product"):
-                try:
-                    db.add_product(title, price_cents, description, file_id)
-                    send_message(chat_id, "محصول با موفقیت اضافه شد ✅")
-                except Exception as e:
-                    logging.exception("add_product error: %s", e)
-                    send_message(chat_id, "خطا در افزودن محصول.")
-            else:
-                send_message(chat_id, "تابع افزودن محصول آماده نیست.")
+            title = m.group(1).strip()
+            price_toman = int(m.group(2))
+            price_cents = price_toman * 100
+            # آخرین سایز بزرگ‌ترین عکس را می‌گیریم
+            file_id = photo[-1]["file_id"] if isinstance(photo, list) and photo else None
+            add_product(title, price_cents, file_id)
+            _send_text(chat_id, f"محصول «{title}» با قیمت {price_toman} تومان ثبت شد.")
             return
-
-        send_message(chat_id, "دستور ناشناخته. از /start استفاده کنید.")
 
     except Exception as e:
-        logging.exception("handle_update error: %s", e)
+        # لاگ مختصر؛ سرویس لایو می‌ماند
+        print("handle_update error:", e)
