@@ -1,139 +1,147 @@
+# src/handlers.py
 import os
-from typing import Optional
+import asyncio
+import httpx
 
-# ایمپورت نسبی از لایه دیتابیس
-from .db import (
-    init_db,
-    set_admins,
+from db import (
     get_or_create_user,
     get_wallet,
     list_products,
     add_product,
 )
 
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-def startup_warmup():
-    """در شروع برنامه، دیتابیس را آماده و ادمین‌ها را ست می‌کند."""
-    init_db()
-    set_admins()
+# --- helpers --------------------------------------------------------------
 
+async def _post(method: str, payload: dict):
+    """Send request to Telegram safely; never raise to break the app."""
+    if not BOT_TOKEN:
+        print("BOT_TOKEN is empty!")
+        return None
+    url = f"{BASE_URL}/{method}"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(url, json=payload)
+            if r.is_success:
+                return r.json()
+            else:
+                print("Telegram API error:", r.status_code, r.text)
+    except Exception as e:
+        print("Telegram send error:", e)
+    return None
 
-def _is_admin(tg_id: int) -> bool:
-    admins = os.getenv("ADMIN_IDS", "").strip()
-    if not admins:
-        return False
-    admin_ids = {int(x) for x in admins.replace(" ", "").split(",") if x}
-    return tg_id in admin_ids
+async def send_message(chat_id: int, text: str, reply_to: int | None = None):
+    await _post(
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_to_message_id": reply_to,
+        },
+    )
 
+def _format_toman(cents: int | None) -> str:
+    """wallet_cents -> تومان (رند ساده)"""
+    if cents is None:
+        return "0"
+    # اگر واحد ذخیره‌سازی «سِنت/ریال» باشد، این تقسیم جلوی اعداد خیلی بزرگ را می‌گیرد.
+    # لازم شد بعدا دقیق‌تر تنظیم می‌کنیم.
+    amount = int(cents) // 10
+    return f"{amount:,}"
 
-def _fmt_toman(cents: int) -> str:
-    # واحد داخلی ما 'سِنت' است (هر 100 = 1 تومان)
-    toman = cents // 100
-    return f"{toman:,} تومان".replace(",", "،")
-
+# --- core handler ---------------------------------------------------------
 
 async def handle_update(update: dict):
     """
-    فقط پیام‌های متنی ساده و عکس با کپشن را پوشش می‌دهیم.
-    /start , /products , /wallet
-    ادمین: ارسال عکس با کپشن = افزودن محصول
-      قالب کپشن:  عنوان | قیمت‌تومان | توضیحات (اختیاری)
+    مین‌هندلر وبهوک: فقط کارهای امن و ساده که قبلا داشتیم:
+      - /start: خوش‌آمد، ایجاد کاربر در DB (اگر نبود)
+      - /products: لیست محصولات یا پیام «هنوز محصولی ثبت نشده است.»
+      - /wallet: نمایش موجودی کیف پول
+      - ادمین: ارسال عکس با کپشن "نام | قیمت" => افزودن محصول
+    هر خطایی فقط لاگ می‌شود تا سرویس لایو بماند.
     """
     try:
-        msg = update.get("message") or update.get("edited_message")
-        if not msg:
+        message = update.get("message") or update.get("edited_message")
+        if not message:
             return
 
-        chat_id = msg["chat"]["id"]
-        from_user = msg.get("from") or {}
-        tg_id = int(from_user.get("id", 0))
+        chat = message.get("chat") or {}
+        chat_id = chat.get("id")
+        if chat_id is None:
+            return
 
-        # کاربر را اگر نبود بسازیم/بخوانیم
-        user = get_or_create_user(from_user)  # {'tg_id','wallet_cents','is_admin'}
+        from_user = message.get("from") or {}
+        tg_id = from_user.get("id")
 
-        text: Optional[str] = msg.get("text")
+        # کاربر را بساز/بخوان (ایمن)
+        try:
+            user = get_or_create_user(tg_id)
+        except Exception as e:
+            print("get_or_create_user error:", e)
+            user = {"is_admin": False}
 
-        # عکس با کپشن (فقط برای ادمین‌ها)
-        if "photo" in msg and _is_admin(tg_id):
-            caption = msg.get("caption") or ""
-            if caption:
-                # قالب: title | price_in_toman | desc(optional)
-                parts = [p.strip() for p in caption.split("|")]
-                if len(parts) >= 2:
-                    title = parts[0]
-                    try:
-                        price_toman = int(parts[1].replace("،", "").replace(",", ""))
-                    except ValueError:
-                        await _send_text(chat_id, "❌ قیمت نامعتبر است. مثال: «کِرِپ شکلات | 85000 | توضیح اختیاری»")
-                        return
-                    desc = parts[2] if len(parts) >= 3 else None
+        text = (message.get("text") or "").strip()
 
-                    # بزرگ‌ترین فایل‌اید عکس را بگیریم
-                    photo_sizes = msg["photo"]
-                    file_id = photo_sizes[-1]["file_id"]
+        # ---- commands ----
+        if text == "/start":
+            await send_message(
+                chat_id,
+                "سلام! به ربات خوش آمدید.\n"
+                "دستورات:\n"
+                "/products , /wallet/\n"
+                "اگر ادمین هستید، برای افزودن یک محصول با عکس، کپشن را به شکل «نام | قیمت» بفرستید."
+            )
+            return
 
-                    add_product(title=title, price_cents=price_toman * 100, caption=desc, photo_file_id=file_id)
-                    await _send_text(chat_id, f"✅ محصول «{title}» ذخیره شد.")
-                    return
+        if text == "/wallet":
+            try:
+                cents = get_wallet(tg_id)
+                await send_message(chat_id, f"موجودی کیف پول شما: {_format_toman(cents)} تومان")
+            except Exception as e:
+                print("wallet error:", e)
+                await send_message(chat_id, "خطا در دریافت کیف پول.")
+            return
+
+        if text == "/products":
+            try:
+                items = list_products()
+                if not items:
+                    await send_message(chat_id, "هنوز محصولی ثبت نشده است.")
                 else:
-                    await _send_text(chat_id, "❌ قالب کپشن: «عنوان | قیمت‌ تومانی | توضیح(اختیاری)»")
-                    return
+                    lines = []
+                    for p in items:
+                        # انتظار: هر ردیف دیکشنری/تاپل شامل name و price_cents
+                        name = p.get("name") if isinstance(p, dict) else p[1]
+                        price_cents = p.get("price_cents") if isinstance(p, dict) else p[2]
+                        lines.append(f"• {name} — {_format_toman(price_cents)} تومان")
+                    await send_message(chat_id, "\n".join(lines))
+            except Exception as e:
+                print("list_products error:", e)
+                await send_message(chat_id, "خطا در دریافت لیست محصولات.")
+            return
 
-        # دستورات متنی
-        if text:
-            cmd = text.strip().lower()
-            if cmd == "/start":
-                await _send_text(
-                    chat_id,
-                    "سلام! به ربات خوش آمدید.\n"
-                    "دستورات: /products , /wallet\n"
-                    "اگر ادمین هستید، برای افزودن محصول یک عکس با کپشن بفرستید.",
-                )
-                return
+        # ---- admin: add product via photo + caption "name | price" ----
+        if user.get("is_admin") and ("photo" in message) and message.get("caption"):
+            caption = message["caption"].strip()
+            if "|" in caption:
+                try:
+                    name, price_str = [part.strip() for part in caption.split("|", 1)]
+                    # ساده: قیمت را عددی می‌کنیم و فرض می‌کنیم تومان است -> به سنت/ریال تبدیل
+                    price_cents = int("".join(ch for ch in price_str if ch.isdigit())) * 10
+                    # از بزرگ‌ترین سایز photo فایل آی‌دی می‌گیریم
+                    file_id = message["photo"][-1]["file_id"]
+                    add_product(name=name, price_cents=price_cents, photo_file_id=file_id)
+                    await send_message(chat_id, "✅ محصول ذخیره شد.")
+                except Exception as e:
+                    print("add_product error:", e)
+                    await send_message(chat_id, "خطا در افزودن محصول. فرمت کپشن: «نام | قیمت»")
+            else:
+                await send_message(chat_id, "فرمت کپشن: «نام | قیمت»")
+            return
 
-            if cmd == "/wallet":
-                balance = get_wallet(tg_id)
-                await _send_text(chat_id, f"موجودی کیف پول شما: {_fmt_toman(balance)}")
-                return
-
-            if cmd == "/products":
-                prods = list_products()
-                if not prods:
-                    await _send_text(chat_id, "هنوز محصولی ثبت نشده است.")
-                    return
-
-                # ارسال فهرست ساده (برای سادگی فعلاً فقط متن)
-                lines = []
-                for p in prods:
-                    lines.append(f"• {p['title']} — {_fmt_toman(p['price_cents'])}")
-                    if p.get("caption"):
-                        lines.append(f"  {p['caption']}")
-                await _send_text(chat_id, "\n".join(lines))
-                return
-
+        # سایر پیام‌ها را نادیده می‌گیریم تا چیزی خراب نشود
     except Exception as e:
-        # لاگ خطا در رندر دیده می‌شود
         print("handle_update error:", e)
-
-
-# --- کمک‌متد ارسال پیام تلگرام (ساده و بدون کتابخانه) ---
-import http.client
-import json
-from urllib.parse import urlencode
-
-
-def _bot_token() -> str:
-    return os.environ["BOT_TOKEN"].strip()
-
-
-async def _send_text(chat_id: int, text: str):
-    try:
-        payload = {"chat_id": chat_id, "text": text}
-        body = urlencode(payload)
-        conn = http.client.HTTPSConnection("api.telegram.org", timeout=10)
-        conn.request("POST", f"/bot{_bot_token()}/sendMessage", body,
-                     headers={"Content-Type": "application/x-www-form-urlencoded"})
-        conn.getresponse().read()  # پاسخی لازم نداریم
-        conn.close()
-    except Exception as e:
-        print("send_message error:", e)
