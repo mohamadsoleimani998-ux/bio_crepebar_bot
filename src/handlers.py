@@ -1,194 +1,90 @@
-# src/handlers.py
-from typing import Dict, Any, Optional
+import os
+from typing import Any, Dict
 
-# =========================
-# ایمپورت‌های لایه Base
-# =========================
-# این‌ها باید وجود داشته باشند و قبلاً کار می‌کردند
-from src.base import send_message, send_menu  # ← همین‌هایی که دارید
-
-# set_my_commands ممکن است در base نباشد؛ اگر نبود، نال-اپ بگذاریم
+from src.base import send_message, send_menu, set_my_commands
+from src.db import get_or_create_user, get_wallet, list_products
+# اختیاری‌ها: اگر پیاده‌سازی نشده باشند، ایمپورت بی‌اثر می‌شود
 try:
-    from src.base import set_my_commands
+    from src.db import add_product, set_admins  # type: ignore
 except Exception:
-    def set_my_commands(*args, **kwargs):
-        # no-op
-        return None
+    add_product = None
+    set_admins = None
 
+BOT_USERNAME = os.getenv("BOT_USERNAME")  # اختیاری
 
-# =========================
-# ایمپورت‌های دیتابیس
-# =========================
+def _get_update_parts(update: Dict[str, Any]):
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat = msg.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (msg.get("text") or "").strip()
+    from_user = msg.get("from") or {}
+    return chat_id, text, from_user
 
-# الزامـی‌ها: اگر نبودند، بگذارید خطا بده تا سریع متوجه شویم
-from src.db import get_or_create_user, get_wallet, list_products  # ← همین‌هایی که قبلاً بود
-
-# اختیاری‌ها: اگر در db.py تعریف نشده باشند، نسخه‌ی امن بگذار
-try:
-    from src.db import add_product
-except Exception:
-    def add_product(*_args, **_kwargs):
-        print("WARN: add_product تعریف نشده است (db.py).")
-        return None
-
-try:
-    from src.db import set_admins
-except Exception:
-    def set_admins(*_args, **_kwargs):
-        # نال-اپ: نبودنش نباید سرویس را بخواباند
-        return None
-
-try:
-    from src.db import init_db
-except Exception:
-    def init_db():
-        # نال-اپ
-        return None
-
-
-# =========================
-# ابزارهای کمکی داخلی
-# =========================
-def _get_msg(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    return update.get("message") or update.get("edited_message")
-
-def _txt(msg: Dict[str, Any]) -> str:
-    return (msg.get("text") or "").strip()
-
-def _chat_id(msg: Dict[str, Any]) -> int:
-    # هم برای private و هم group درست کار می‌کند
-    return msg.get("chat", {}).get("id")
-
-def _user_fields(msg: Dict[str, Any]) -> Dict[str, Any]:
-    u = msg.get("from", {}) or {}
-    return {
-        "tg_id": u.get("id"),
-        "first_name": u.get("first_name"),
-        "last_name": u.get("last_name"),
-        "username": u.get("username"),
-    }
-
-
-# =========================
-# راه‌اندازی سبک (اختیاری)
-# =========================
-async def startup_warmup() -> None:
-    """
-    صدا زده می‌شود موقع بالا آمدن سرویس.
-    اگر set_my_commands داشته باشید، لیست کامندها را روی تلگرام می‌نشیند.
-    نبودنش هم مشکلی ایجاد نمی‌کند.
-    """
+async def _handle_command(chat_id: int, cmd: str, from_user: Dict[str, Any]):
+    # کاربر را بساز/بروزرسانی کن (جلوگیری از خطای نال)
     try:
-        set_my_commands([
-            ("/start", "شروع"),
-            ("/products", "دیدن محصولات"),
-            ("/wallet", "کیف پول"),
-        ])
+        get_or_create_user(
+            tg_id=from_user.get("id"),
+            first_name=from_user.get("first_name"),
+            last_name=from_user.get("last_name"),
+            username=from_user.get("username"),
+        )
     except Exception as e:
-        print("startup_warmup warning:", e)
+        print("get_or_create_user error:", e)
 
+    if cmd in ("/start", f"/start@{BOT_USERNAME}" if BOT_USERNAME else ""):
+        set_my_commands([
+            ("start", "شروع"),
+            ("products", "مشاهده محصولات"),
+            ("wallet", "کیف پول"),
+        ])
+        await send_menu(chat_id)
+        return
 
-# =========================
-# هندلر اصلی آپدیت
-# =========================
-async def handle_update(update: Dict[str, Any]) -> None:
-    """
-    فقط چیزهای لازم را انجام می‌دهد و اگر تابعی در db نبود،
-    با نال-اپ‌ها سرویس را سرپا نگه می‌داریم.
-    """
-    try:
-        msg = _get_msg(update)
-        if not msg:
-            return
-
-        chat_id = _chat_id(msg)
-        fields = _user_fields(msg)
-        tg_id = fields["tg_id"]
-
-        # کاربر را بساز/بگیر (الزامی است)
+    if cmd.startswith("/wallet"):
         try:
-            get_or_create_user(
-                tg_id=tg_id,
-                first_name=fields["first_name"],
-                last_name=fields["last_name"],
-                username=fields["username"],
-            )
+            cents = get_wallet(from_user.get("id"))
+            tomans = cents // 10  # در صورت نیاز تغییر بده
+            await send_message(chat_id, f"موجودی کیف پول شما: {tomans} تومان")
         except Exception as e:
-            # اگر این خطا بدهد بهتر است در لاگ ببینیم
-            print("get_or_create_user error:", e)
+            print("wallet error:", e)
+            await send_message(chat_id, "خطا در دریافت کیف پول.")
+        return
 
-        text = _txt(msg)
-
-        # ------------------ دستورات متنی
-        if text == "/start":
-            hello = (
-                "سلام! به ربات خوش آمدید.\n"
-                "دستورات: /products , /wallet\n"
-                "اگر ادمین هستید، برای افزودن محصول بعداً گزینه ادمین اضافه می‌کنیم."
-            )
-            await send_message(chat_id, hello)
-            await send_menu(chat_id)  # اگر در base پیاده‌سازی شده باشد
-
-            return
-
-        if text == "/products":
-            try:
-                items = list_products()
-            except Exception as e:
-                print("list_products error:", e)
-                items = []
-
+    if cmd.startswith("/products"):
+        try:
+            items = list_products()
             if not items:
                 await send_message(chat_id, "هنوز محصولی ثبت نشده است.")
             else:
-                # نمایش بسیار ساده
                 lines = []
                 for it in items:
-                    # تلاش برای خواندن فیلدهای متداول؛ اگر نبودند، به شکل safe چاپ می‌کنیم
-                    name = getattr(it, "name", None) or it.get("name") if isinstance(it, dict) else str(it)
-                    price = getattr(it, "price", None) or (it.get("price") if isinstance(it, dict) else None)
-                    if price is not None:
-                        lines.append(f"- {name} | {price}")
-                    else:
-                        lines.append(f"- {name}")
-                await send_message(chat_id, "\n".join(lines) or "لیست خالی است.")
-            return
-
-        if text == "/wallet":
-            try:
-                cents = get_wallet(tg_id)
-            except Exception as e:
-                print("get_wallet error:", e)
-                cents = 0
-            # اگر get_wallet ریال/تومان می‌دهد، همین را چاپ می‌کنیم
-            await send_message(chat_id, f"موجودی کیف پول شما: {cents} تومان")
-            return
-
-        # ------------------ افزودن محصول (نمایش نمونه‌ی ساده؛ فقط اگر add_product واقعی دارید)
-        # اگر پیام عکس با کپشن بود و شما بعداً چک ادمین گذاشتید، اینجا صدا بزنید
-        if "photo" in msg and msg.get("caption"):
-            caption = msg["caption"].strip()
-            # صرفاً نمونه: اگر کپشن با + شروع شود، تلاش برای افزودن محصول
-            if caption.startswith("+"):
-                try:
-                    # فراخوانی امن؛ امضای واقعی add_product هرچه باشد، اینجا خطا نمی‌دهد
-                    add_product(tg_id=tg_id, caption=caption, photo=msg["photo"][-1]["file_id"])
-                    await send_message(chat_id, "درخواست افزوده شدن محصول ثبت شد.")
-                except Exception as e:
-                    print("add_product error:", e)
-                    await send_message(chat_id, "ثبت محصول انجام نشد.")
-            return
-
-        # پیام‌های دیگر را فعلاً نادیده بگیر
+                    price_t = (it.get("price_cents") or 0) // 10
+                    lines.append(f"• {it.get('title')} — {price_t} تومان")
+                await send_message(chat_id, "\n".join(lines))
+        except Exception as e:
+            print("products error:", e)
+            await send_message(chat_id, "خطا در نمایش محصولات.")
         return
 
+    await send_message(chat_id, "دستور ناشناخته است. /start را بفرستید.")
+
+async def handle_update(update: Dict[str, Any]):
+    try:
+        chat_id, text, from_user = _get_update_parts(update)
+        if not chat_id:
+            return
+        if text.startswith("/"):
+            await _handle_command(chat_id, text.split()[0], from_user)
+        else:
+            await send_message(chat_id, "برای راهنما: /start")
     except Exception as e:
-        # هیچ‌وقت نگذارید استثناء باعث کرش پروسه شود
         print("handle_update error:", e)
-        try:
-            # اگر شد به کاربر هم خطا ندهیم، اما برای دیباگ مفید است
-            chat_id = _chat_id(_get_msg(update) or {})
-            if chat_id:
-                await send_message(chat_id, "یک خطای موقتی رخ داد.")
-        except Exception:
-            pass
+
+async def startup_warmup():
+    # فقط ثبت دستورات در استارتاپ
+    set_my_commands([
+        ("start", "شروع"),
+        ("products", "مشاهده محصولات"),
+        ("wallet", "کیف پول"),
+    ])
