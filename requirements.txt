@@ -1,9 +1,12 @@
-python-telegram-bot[webhooks]==20.6
-flask==3.0.2
-gunicorn==21.2.0
+fastapi==0.111.0
+uvicorn==0.30.1
 psycopg2-binary==2.9.9
 requests==2.31.0
-fastapi
-uvicorn
-httpx
-anyio
+httpx==0.27.0
+anyio==4.4.0
+
+# برای هندلرهایی که از aiogram استفاده می‌کنند
+aiogram==2.25.1
+
+# اگر بخشی از کد هنوز از python-telegram-bot استفاده می‌کند، این را نگه‌دار
+python-telegram-bot[webhooks]==20.6
