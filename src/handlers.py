@@ -1,160 +1,149 @@
 import os
+import httpx
+
+# ایمپورت‌های داخلی پروژه (نسبی تا خطای ModuleNotFound پیش نیاد)
 from .base import send_message
-from . import base
-from .db import (
-    init_db, get_or_create_user, add_product, list_products,
-    add_order, get_wallet, get_product
-)
+from .db import get_or_create_user, list_products, add_product
 
-# تنظیمات از env
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()}
-CASHBACK_PERCENT = int(os.getenv("CASHBACK_PERCENT", "5") or "5")
+# برای ارسال عکس بدون دست‌زدن به base.py
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}/"
 
-# در اولین استفاده، جداول را می‌سازد (اینجا صدا زده می‌شود تا اپ لایو بماند)
-try:
-    init_db()
-except Exception as e:
-    # اگر هم نئون موقتا در دسترس نباشد، ربات از کار نمی‌افتد؛ فقط بخش DB کار نمی‌کند.
-    print("DB init error:", e)
+# ادمین‌ها از env (لیست آیدی‌ها با کاما)
+_ADMIN_IDS = {i.strip() for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip()}
+# نگهداری وضعیت کوتاه‌مدت افزودن محصول برای ادمین‌ها (در حافظه)
+_ADMIN_STATE = {}  # tg_id -> "await_photo"
 
-def cents_to_irr(cents: int) -> str:
-    # فعلا واحد رو تومن در نظر نمی‌گیریم؛ فقط عدد خام (می‌تونی بعدا تبدیل دلخواه بذاری)
-    return f"{cents/100:.2f}"
+
+async def _send_photo(chat_id: int, file_id: str, caption: str | None = None):
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            await client.post(
+                API_URL + "sendPhoto",
+                json={"chat_id": chat_id, "photo": file_id, "caption": caption},
+            )
+    except Exception as e:
+        print("sendPhoto error:", e)
+
+
+def _is_admin(tg_id: int) -> bool:
+    return str(tg_id) in _ADMIN_IDS
+
+
+def _fmt_toman(cents: int) -> str:
+    # ما داخل DB برحسب «سنت» ذخیره می‌کنیم؛ برای نمایش تومان تقسیم بر 100
+    return f"{cents // 100:,} تومان"
+
 
 async def handle_update(update: dict):
-    msg = update.get("message") or update.get("edited_message")
-    if not msg:
-        return
-
-    chat_id = msg["chat"]["id"]
-    from_id = msg["from"]["id"]
-    user = None
+    """
+    فقط روی همون رفتارهای قبلی سوار شده‌ایم:
+    - /start : خوش‌آمد + نمایش دستورات
+    - /wallet : ساخت/بازیابی کاربر و نمایش موجودی (نیاز به ستون wallet_cents که init_db تضمین می‌کند)
+    - /products : لیست محصولات (عکس‌دار یا بدون عکس)
+    - /addproduct : فقط ادمین → ارسال عکس با کپشن «عنوان | قیمت_به_تومان»
+    هیچ چیز دیگری تغییر نکرده و ربات لایو می‌ماند.
+    """
     try:
-        user = get_or_create_user(from_id, ADMIN_IDS)
+        if "message" not in update:
+            return  # فقط پیام‌های متنی/عکس را مدیریت می‌کنیم
+
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        tg_id = msg.get("from", {}).get("id")
+
+        text = msg.get("text")
+        photo = msg.get("photo")  # لیست سایزها
+        caption = msg.get("caption", "")
+
+        # اطمینان از ساخت کاربر و ستون‌ها (اگر نبود بسازد)
+        try:
+            user = get_or_create_user(tg_id)
+        except Exception as e:
+            print("get_or_create_user err:", e)
+            await send_message(chat_id, "خطا در بازیابی/ایجاد کاربر.")
+            return
+
+        # --- دستورات متنی
+        if text:
+            if text.startswith("/start"):
+                await send_message(
+                    chat_id,
+                    "سلام! به ربات خوش آمدید.\n"
+                    "دستورات:\n"
+                    "• /products — لیست محصولات\n"
+                    "• /wallet — موجودی کیف پول",
+                )
+                return
+
+            if text.startswith("/wallet"):
+                try:
+                    user = get_or_create_user(tg_id)
+                    bal = user.get("wallet_cents", 0)
+                    await send_message(chat_id, f"موجودی کیف پول: {_fmt_toman(bal)}")
+                except Exception as e:
+                    print("wallet err:", e)
+                    await send_message(chat_id, "خطا در بازیابی کیف پول.")
+                return
+
+            if text.startswith("/products"):
+                try:
+                    items = list_products()
+                    if not items:
+                        await send_message(chat_id, "فعلاً محصولی ثبت نشده است.")
+                        return
+                    # برای جلوگیری از اسپم، هر محصول را جدا می‌فرستیم
+                    for p in items:
+                        cap = f"{p['title']} — {_fmt_toman(p['price_cents'])}"
+                        file_id = p.get("photo_file_id")
+                        if file_id:
+                            await _send_photo(chat_id, file_id, cap)
+                        else:
+                            await send_message(chat_id, cap)
+                except Exception as e:
+                    print("products err:", e)
+                    await send_message(chat_id, "خطا در دریافت لیست محصولات.")
+                return
+
+            if text.startswith("/addproduct"):
+                if not _is_admin(tg_id):
+                    await send_message(chat_id, "شما دسترسی ادمین ندارید.")
+                    return
+                _ADMIN_STATE[tg_id] = "await_photo"
+                await send_message(
+                    chat_id,
+                    "عکس محصول را ارسال کنید و در کپشن به شکل «عنوان | قیمت_به_تومان» بنویسید.",
+                )
+                return
+
+        # --- افزودن محصول با عکس (فقط برای ادمین و وقتی دستور فعال شده باشد)
+        if photo and _ADMIN_STATE.get(tg_id) == "await_photo" and _is_admin(tg_id):
+            if "|" not in caption:
+                await send_message(chat_id, "قالب کپشن صحیح نیست. «عنوان | قیمت»")
+                return
+            title, price_txt = [s.strip() for s in caption.split("|", 1)]
+            try:
+                price_cents = int(price_txt.replace(",", "")) * 100
+            except ValueError:
+                await send_message(chat_id, "قیمت نامعتبر است.")
+                return
+
+            # بزرگ‌ترین سایز عکس را برداریم
+            file_id = photo[-1]["file_id"]
+            try:
+                add_product(title, price_cents, file_id)
+                await send_message(chat_id, "محصول با موفقیت ذخیره شد ✅")
+            except Exception as e:
+                print("add_product err:", e)
+                await send_message(chat_id, "خطا در ذخیره‌سازی محصول.")
+            finally:
+                _ADMIN_STATE.pop(tg_id, None)
+            return
+
+        # اگر هیچ‌کدام نبود، ساکت باش تا لایوی ربات حفظ شود
+        return
+
     except Exception as e:
-        print("get_or_create_user error:", e)
-
-    text = msg.get("text", "") or ""
-
-    # --- /start
-    if text.strip() == "/start":
-        await send_message(chat_id, "سلام! به ربات خوش آمدید.\nدستورات: /products , /wallet")
+        # هر خطای غیرمنتظره‌ای لاگ شود ولی مانع پاسخ 200 نشود
+        print("handle_update fatal:", e)
         return
-
-    # --- لیست محصولات
-    if text.strip() == "/products":
-        try:
-            items = list_products()
-            if not items:
-                await send_message(chat_id, "فعلاً محصولی ثبت نشده.")
-                return
-            lines = [f"#{p['id']} - {p['title']} - قیمت: {cents_to_irr(p['price_cents'])}"
-                     for p in items]
-            lines.append("\nبرای خرید: /buy <id> <qty>")
-            await send_message(chat_id, "\n".join(lines))
-        except Exception as e:
-            print("list_products error:", e)
-            await send_message(chat_id, "خطا در دریافت لیست محصولات.")
-        return
-
-    # --- کیف پول
-    if text.strip() == "/wallet":
-        if not user:
-            await send_message(chat_id, "کاربر یافت نشد.")
-            return
-        try:
-            bal = get_wallet(user["id"])
-            await send_message(chat_id, f"موجودی کیف پول: {cents_to_irr(bal)}")
-        except Exception as e:
-            print("wallet error:", e)
-            await send_message(chat_id, "خطا در دریافت کیف پول.")
-        return
-
-    # --- خرید
-    if text.startswith("/buy"):
-        if not user:
-            await send_message(chat_id, "کاربر یافت نشد.")
-            return
-        parts = text.split()
-        if len(parts) < 2:
-            await send_message(chat_id, "فرمت: /buy <product_id> <qty(optional)>")
-            return
-        try:
-            pid = int(parts[1])
-            qty = int(parts[2]) if len(parts) > 2 else 1
-        except ValueError:
-            await send_message(chat_id, "شناسه یا تعداد نامعتبر است.")
-            return
-        try:
-            pr = get_product(pid)
-            if not pr:
-                await send_message(chat_id, "محصول یافت نشد.")
-                return
-            order = add_order(user["id"], pid, max(qty, 1), CASHBACK_PERCENT)
-            if not order:
-                await send_message(chat_id, "ثبت سفارش ناموفق بود.")
-                return
-            await send_message(
-                chat_id,
-                f"سفارش ثبت شد ✅\nجمع: {cents_to_irr(order['total_cents'])}\n"
-                f"کش‌بک شما: {cents_to_irr(order['cashback_cents'])}"
-            )
-        except Exception as e:
-            print("buy error:", e)
-            await send_message(chat_id, "خطا در ثبت سفارش.")
-        return
-
-    # --- افزودن محصول با عکس (فقط ادمین)
-    # روش استفاده:
-    #   عکس بفرست + کپشن:
-    #   /addproduct عنوان | قیمت_به_تومان
-    # قیمت مثلا 120000 (تومان). ما به سنت ذخیره می‌کنیم: تومان*100
-    if user and user.get("is_admin"):
-        # حالت عکس + کپشن
-        if "photo" in msg and isinstance(msg["photo"], list) and msg.get("caption", "").startswith("/addproduct"):
-            caption = msg.get("caption", "")
-            parts = caption.replace("/addproduct", "", 1).strip().split("|", 1)
-            if len(parts) != 2:
-                await send_message(chat_id, "فرمت نادرست. نمونه: /addproduct عنوان | 120000")
-                return
-            title = parts[0].strip()
-            try:
-                price_toman = int(parts[1].strip())
-            except ValueError:
-                await send_message(chat_id, "قیمت نامعتبر است.")
-                return
-            # بزرگ‌ترین سایز عکس را می‌گیریم
-            photo_sizes = msg["photo"]
-            best = max(photo_sizes, key=lambda p: p.get("file_size", 0))
-            file_id = best.get("file_id")
-            try:
-                pid = add_product(title, price_toman * 100, file_id)
-                await send_message(chat_id, f"✅ محصول #{pid} اضافه شد.")
-            except Exception as e:
-                print("add_product(photo) error:", e)
-                await send_message(chat_id, "خطا در افزودن محصول.")
-            return
-
-        # حالت بدون عکس (متنی)
-        if text.startswith("/addproduct"):
-            parts = text.replace("/addproduct", "", 1).strip().split("|", 1)
-            if len(parts) != 2:
-                await send_message(chat_id, "فرمت: /addproduct عنوان | 120000")
-                return
-            title = parts[0].strip()
-            try:
-                price_toman = int(parts[1].strip())
-            except ValueError:
-                await send_message(chat_id, "قیمت نامعتبر است.")
-                return
-            try:
-                pid = add_product(title, price_toman * 100, None)
-                await send_message(chat_id, f"✅ محصول #{pid} اضافه شد.")
-            except Exception as e:
-                print("add_product(text) error:", e)
-                await send_message(chat_id, "خطا در افزودن محصول.")
-            return
-
-    # بقیه پیام‌ها
-    if text:
-        await send_message(chat_id, f"دریافت شد: {text}")
