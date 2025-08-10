@@ -1,11 +1,16 @@
-from fastapi import FastAPI, Request
+# src/bot.py
 import os
-from src.handlers import handle_update  # اصلاح ایمپورت
+from fastapi import FastAPI, Request
+from .handlers import handle_update
 
 app = FastAPI()
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    data = await request.json()
-    await handle_update(data)
+    update = await request.json()
+    await handle_update(update)
     return {"ok": True}
+
+@app.get("/")
+async def root():
+    return {"status": "bot is running"}
