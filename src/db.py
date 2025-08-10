@@ -1,111 +1,77 @@
 import os
-import psycopg2
-import psycopg2.extras
+import sqlite3
 
-_CONN = None
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
-def _get_conn():
-    """single connection with ssl, reused"""
-    global _conn
-    if '_conn' not in globals() or globals().get('_conn') is None:
-        dsn = os.getenv("DATABASE_URL")
-        if not dsn:
-            raise RuntimeError("DATABASE_URL is not set")
-        # force ssl
-        if "sslmode" not in dsn:
-            if "?" in dsn:
-                dsn = dsn + "&sslmode=require"
-            else:
-                dsn = dsn + "?sslmode=require"
-        globals()['_conn'] = psycopg2.connect(dsn)
-        globals()['_conn'].autocommit = True
-    return globals()['_conn']
+# اتصال به دیتابیس
+def get_conn():
+    return sqlite3.connect(DB_PATH)
 
+# ساخت جداول
 def init_db():
-    """create/align schema; safe to call multiple times"""
-    try:
-        conn = _get_conn()
-        cur = conn.cursor()
-        # users
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                tg_id        BIGINT PRIMARY KEY,
-                wallet_cents INTEGER NOT NULL DEFAULT 0,
-                is_admin     BOOLEAN NOT NULL DEFAULT FALSE
-            );
-        """)
-        # columns safety (in case table existed with different shape)
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_cents INTEGER NOT NULL DEFAULT 0;")
-        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;")
-        # products
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id SERIAL PRIMARY KEY,
-                name TEXT NOT NULL,
-                price_cents INTEGER NOT NULL,
-                photo_file_id TEXT
-            );
-        """)
-        print("DB schema ok")
-    except Exception as e:
-        # do not crash startup
-        print("init_db error:", e)
+    conn = get_conn()
+    cur = conn.cursor()
+    # جدول کاربران
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            wallet_cents INTEGER DEFAULT 0
+        )
+    """)
+    # جدول محصولات
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            price_cents INTEGER,
+            description TEXT,
+            photo_id TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
-def get_or_create_user(tg_id: int):
-    """returns dict: {tg_id, wallet_cents, is_admin}"""
-    try:
-        conn = _get_conn()
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT tg_id, wallet_cents, is_admin FROM users WHERE tg_id=%s;", (tg_id,))
-            row = cur.fetchone()
-            if row:
-                return {"tg_id": row["tg_id"], "wallet_cents": row["wallet_cents"], "is_admin": row["is_admin"]}
-            cur.execute("INSERT INTO users (tg_id) VALUES (%s) RETURNING tg_id, wallet_cents, is_admin;", (tg_id,))
-            row = cur.fetchone()
-            return {"tg_id": row["tg_id"], "wallet_cents": row["wallet_cents"], "is_admin": row["is_admin"]}
-    except Exception as e:
-        print("get_or_create_user err:", e)
-        # keep bot alive
-        return {"tg_id": tg_id, "wallet_cents": 0, "is_admin": False}
+# گرفتن یا ساختن کاربر
+def get_or_create_user(user_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, wallet_cents FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return row
+    cur.execute("INSERT INTO users (user_id, wallet_cents) VALUES (?, ?)", (user_id, 0))
+    conn.commit()
+    conn.close()
+    return (user_id, 0)
 
-def get_wallet(tg_id: int) -> int:
-    """returns wallet cents; 0 on error"""
-    try:
-        conn = _get_conn()
-        with conn.cursor() as cur:
-            cur.execute("SELECT wallet_cents FROM users WHERE tg_id=%s;", (tg_id,))
-            r = cur.fetchone()
-            return r[0] if r else 0
-    except Exception as e:
-        print("get_wallet err:", e)
-        return 0
+# گرفتن موجودی کیف پول
+def get_wallet(user_id: int) -> int:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT wallet_cents FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row[0] or 0
+    return 0
 
+# لیست محصولات
 def list_products():
-    """list of dicts"""
-    try:
-        conn = _get_conn()
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT id, name, price_cents, photo_file_id FROM products ORDER BY id DESC;")
-            rows = cur.fetchall()
-            return [
-                {"id": r["id"], "name": r["name"], "price_cents": r["price_cents"], "photo_file_id": r["photo_file_id"]}
-                for r in rows
-            ]
-    except Exception as e:
-        print("list_products err:", e)
-        return []
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, price_cents, description, photo_id FROM products ORDER BY id DESC")
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
-def add_product(name: str, price_cents: int, photo_file_id: str | None):
-    """insert product; returns id or None"""
-    try:
-        conn = _get_conn()
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO products (name, price_cents, photo_file_id) VALUES (%s,%s,%s) RETURNING id;",
-                (name, price_cents, photo_file_id),
-            )
-            r = cur.fetchone()
-            return r[0] if r else None
-    except Exception as e:
-        print("add_product err:", e)
-        return None
+# افزودن محصول
+def add_product(title: str, price_cents: int, description: str, photo_id: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO products (title, price_cents, description, photo_id) VALUES (?, ?, ?, ?)",
+        (title, price_cents, description, photo_id)
+    )
+    conn.commit()
+    conn.close()
