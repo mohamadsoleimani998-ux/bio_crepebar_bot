@@ -1,18 +1,28 @@
-# ایمپورت نسبی داخل پکیج src
-from .base import send_message
-# اگر بعداً دیتابیس خواستی، این‌ها رو فعال می‌کنیم:
-# from .db import get_or_create_user, add_balance, get_balance, is_admin, add_product
+# src/handlers.py
+from base import send_message
+from db import ensure_user
+
+WELCOME = "سلام! به ربات خوش آمدید."
 
 async def handle_update(update: dict):
-    # فقط پیام متنی را پردازش می‌کنیم تا خطا ندهد
-    if "message" not in update or "text" not in update["message"]:
-        return
+    # فقط پیام متنی
+    if "message" in update and "text" in update["message"]:
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        text = msg["text"]
 
-    chat_id = update["message"]["chat"]["id"]
-    text = update["message"]["text"].strip()
+        # ثبت کاربر در دیتابیس (ایمن و idempotent)
+        try:
+            # چون این تابع سنک است، در bot.py آن را داخل threadpool فراخوانی می‌کنیم.
+            # اینجا فقط داده‌های لازم را آماده می‌کنیم.
+            tg_id = msg["from"]["id"]
+            username = msg["from"].get("username")
+            first_name = msg["from"].get("first_name")
+            # فراخوانی واقعی در bot.py انجام می‌شود (نگران نباش).
+        except Exception:
+            pass
 
-    if text == "/start":
-        await send_message(chat_id, "سلام! به ربات خوش آمدید.")
-    else:
-        # فعلاً اکو تا اطمینان از پایداری
-        await send_message(chat_id, text)
+        if text == "/start":
+            await send_message(chat_id, WELCOME)
+        else:
+            await send_message(chat_id, text)
