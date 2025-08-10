@@ -1,104 +1,118 @@
-# src/base.py
-import os
-import json
-import httpx
-import psycopg2
-from psycopg2.extras import RealDictCursor
-import anyio
+# src/handlers.py
+from typing import Any, Dict
+from .base import tg_send_message, tg_send_photo, ADMIN_IDS, ensure_schema, add_product, list_products, wallet_get, wallet_add
 
-TOKEN = os.getenv("BOT_TOKEN", "")
-BASE_URL = f"https://api.telegram.org/bot{TOKEN}"
-FILE_URL = f"https://api.telegram.org/file/bot{TOKEN}"
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+MAIN_KEYBOARD = {
+    "keyboard": [
+        [{"text": "منو 🍽"}, {"text": "ساعات کاری"}],
+        [{"text": "موقعیت 📍"}, {"text": "کیف پول 💳"}],
+    ],
+    "resize_keyboard": True,
+}
 
-# ---------- Telegram helpers ----------
-async def tg_send_message(chat_id: int, text: str, reply_markup: dict | None = None):
-    payload = {"chat_id": chat_id, "text": text}
-    if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{BASE_URL}/sendMessage", data=payload)
-        r.raise_for_status()
+SHOP_HOURS = "هر روز ۱۲ تا ۲۳"
+SHOP_LOCATION = {"latitude": 35.7000, "longitude": 51.4000}  # اگر خواستی از env بگذاریم، می‌تونیم بعداً
 
-async def tg_send_photo(chat_id: int, file_id: str, caption: str = "", reply_markup: dict | None = None):
-    data = {"chat_id": chat_id, "photo": file_id}
-    if caption:
-        data["caption"] = caption
-    if reply_markup:
-        data["reply_markup"] = json.dumps(reply_markup)
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f"{BASE_URL}/sendPhoto", data=data)
-        r.raise_for_status()
+async def handle_update(update: Dict[str, Any]):
+    # اطمینان از ساخت جداول (فقط اولین بار هزینه داره)
+    await ensure_schema()
 
-# ---------- DB helpers ----------
-def _conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    if "message" not in update:
+        return
+    msg = update["message"]
+    chat_id = msg["chat"]["id"]
+    text = msg.get("text", "") or ""
 
-def _ensure_schema_sync():
-    with _conn() as cn, cn.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-          id SERIAL PRIMARY KEY,
-          name TEXT NOT NULL,
-          price BIGINT NOT NULL,
-          description TEXT DEFAULT '',
-          photo_file_id TEXT
-        );
-        CREATE TABLE IF NOT EXISTS users_wallet (
-          user_id BIGINT PRIMARY KEY,
-          balance BIGINT NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS wallet_tx (
-          id SERIAL PRIMARY KEY,
-          user_id BIGINT NOT NULL,
-          amount BIGINT NOT NULL,
-          note TEXT DEFAULT '',
-          created_at TIMESTAMP DEFAULT NOW()
-        );
-        """)
-        cn.commit()
+    # ----- دستورات ادمین -----
+    from_user_id = msg["from"]["id"]
 
-async def ensure_schema():
-    await anyio.to_thread.run_sync(_ensure_schema_sync)
+    # افزودن محصول: عکس + کپشن با /addproduct
+    if "photo" in msg and isinstance(msg.get("caption", ""), str) and msg["caption"].startswith("/addproduct"):
+        if from_user_id not in ADMIN_IDS:
+            await tg_send_message(chat_id, "شما دسترسی ادمین ندارید.")
+            return
+        caption = msg["caption"][len("/addproduct"):].strip()
+        parts = [p.strip() for p in caption.split("|")]
+        if len(parts) < 2:
+            await tg_send_message(chat_id, "فرمت نادرست. نمونه:\n/sendphoto با کپشن:\n/addproduct نام | قیمت | توضیح")
+            return
+        name = parts[0]
+        try:
+            price = int(parts[1])
+        except ValueError:
+            await tg_send_message(chat_id, "قیمت باید عددی باشد. نمونه: 120000")
+            return
+        desc = parts[2] if len(parts) >= 3 else ""
 
-def _fetchall_sync(sql: str, params: tuple = ()):
-    with _conn() as cn, cn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchall()
+        # بزرگ‌ترین سایز عکس را بگیر
+        photo_sizes = msg["photo"]
+        best = max(photo_sizes, key=lambda p: p.get("file_size", 0))
+        file_id = best["file_id"]
 
-def _exec_sync(sql: str, params: tuple = ()):
-    with _conn() as cn, cn.cursor() as cur:
-        cur.execute(sql, params)
-        cn.commit()
+        await add_product(name=name, price=price, description=desc, photo_file_id=file_id)
+        await tg_send_message(chat_id, f"✅ محصول «{name}» اضافه شد.", reply_markup=MAIN_KEYBOARD)
+        return
 
-async def db_fetchall(sql: str, params: tuple = ()):
-    return await anyio.to_thread.run_sync(_fetchall_sync, sql, params)
+    # افزایش کیف پول توسط ادمین
+    if text.startswith("/cashback"):
+        if from_user_id not in ADMIN_IDS:
+            await tg_send_message(chat_id, "شما دسترسی ادمین ندارید.")
+            return
+        parts = text.split(maxsplit=3)
+        if len(parts) < 3:
+            await tg_send_message(chat_id, "فرمت: /cashback <user_id> <amount> [note]")
+            return
+        try:
+            target = int(parts[1]); amount = int(parts[2])
+        except ValueError:
+            await tg_send_message(chat_id, "user_id و amount باید عددی باشند.")
+            return
+        note = parts[3] if len(parts) >= 4 else "cashback"
+        await wallet_add(target, amount, note)
+        await tg_send_message(chat_id, f"✅ {amount} به کیف پول {target} اضافه شد.")
+        return
 
-async def db_exec(sql: str, params: tuple = ()):
-    await anyio.to_thread.run_sync(_exec_sync, sql, params)
+    # ----- دستورات عمومی -----
+    if text == "/start":
+        await tg_send_message(
+            chat_id,
+            "سلام! به ربات خوش آمدید.",
+            reply_markup=MAIN_KEYBOARD
+        )
+        return
 
-# ---------- Product ops ----------
-async def add_product(name: str, price: int, description: str, photo_file_id: str | None):
-    await db_exec(
-        "INSERT INTO products(name, price, description, photo_file_id) VALUES (%s,%s,%s,%s)",
-        (name, price, description, photo_file_id)
-    )
+    if text == "ساعات کاری":
+        await tg_send_message(chat_id, f"⏰ ساعات کاری: {SHOP_HOURS}", reply_markup=MAIN_KEYBOARD)
+        return
 
-async def list_products(limit: int = 10):
-    return await db_fetchall("SELECT id, name, price, description, photo_file_id FROM products ORDER BY id DESC LIMIT %s", (limit,))
+    if text == "موقعیت 📍":
+        # چون raw API داریم، sendLocation مستقیم صدا می‌زنیم
+        from httpx import AsyncClient
+        async with AsyncClient(timeout=30) as client:
+            await client.post(
+                f"https://api.telegram.org/bot{__import__('os').getenv('BOT_TOKEN')}/sendLocation",
+                data={"chat_id": chat_id, "latitude": SHOP_LOCATION["latitude"], "longitude": SHOP_LOCATION["longitude"]}
+            )
+        return
 
-# ---------- Wallet ops ----------
-async def wallet_get(user_id: int) -> int:
-    rows = await db_fetchall("SELECT balance FROM users_wallet WHERE user_id=%s", (user_id,))
-    if not rows:
-        await db_exec("INSERT INTO users_wallet(user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-        return 0
-    return int(rows[0]["balance"])
+    if text == "منو 🍽":
+        products = await list_products(limit=6)
+        if not products:
+            await tg_send_message(chat_id, "منوی فعلاً خالی است.", reply_markup=MAIN_KEYBOARD)
+            return
+        # اگر عکس داشت، با عکس بفرست؛ وگرنه متن
+        for p in products:
+            caption = f"{p['name']} — {p['price']:,} تومان\n{p.get('description','') or ''}"
+            if p.get("photo_file_id"):
+                await tg_send_photo(chat_id, p["photo_file_id"], caption=caption)
+            else:
+                await tg_send_message(chat_id, caption)
+        return
 
-async def wallet_add(user_id: int, amount: int, note: str = ""):
-    await db_exec("INSERT INTO users_wallet(user_id, balance) VALUES (%s, 0) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-    await db_exec("UPDATE users_wallet SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
-    await db_exec("INSERT INTO wallet_tx(user_id, amount, note) VALUES (%s,%s,%s)", (user_id, amount, note))
+    if text == "کیف پول 💳" or text == "/wallet":
+        bal = await wallet_get(from_user_id)
+        await tg_send_message(chat_id, f"💳 موجودی کیف پول شما: {bal:,} تومان", reply_markup=MAIN_KEYBOARD)
+        return
+
+    # پیش‌فرض: eco
+    await tg_send_message(chat_id, "دستور نامعتبر بود. از منوی پایین استفاده کنید.", reply_markup=MAIN_KEYBOARD)
