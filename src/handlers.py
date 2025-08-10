@@ -1,27 +1,77 @@
 import os
 from typing import Dict, Any
 
-# اگر base توابع ارسال پیام/منو رو داره، همون‌ها رو استفاده می‌کنیم
-from src.base import send_message, send_menu
+# --- تلاش برای استفاده از توابع آماده در base.py (اگر باشند)
+_HAS_BASE_SEND = False
+try:
+    from src.base import send_message as _base_send_message  # ممکن است وجود نداشته باشد
+    from src.base import send_menu as _base_send_menu        # ممکن است وجود نداشته باشد
+    _HAS_BASE_SEND = True
+except Exception:
+    _HAS_BASE_SEND = False
 
-# توابع دیتابیس—فقط ایمپورت مطلق
+# --- وابستگی‌ها
+import requests
+
 from src.db import (
-    init_db,          # اگر جایی لازم شد
-    set_admins,       # اگر جایی لازم شد
+    init_db,          # فقط اگر جای دیگری لازم شد
+    set_admins,       # فقط اگر جای دیگری لازم شد
     get_or_create_user,
     get_wallet,
     list_products,
-    add_product,      # برای بعداً (افزودن محصول)
+    add_product,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
 
+
+# ====== Fallback ها در صورت نبودن توابع در base.py ======
+def _fallback_send_message(chat_id: int, text: str) -> None:
+    """ارسال متن ساده با Telegram API (اگر base.send_message نبود)."""
+    if not (API_URL and chat_id and text is not None):
+        return
+    try:
+        requests.post(f"{API_URL}/sendMessage", json={"chat_id": chat_id, "text": text})
+    except Exception as _e:
+        print("fallback send_message error:", _e)
+
+
+def _fallback_send_menu(chat_id: int) -> None:
+    """پیام خوش‌آمد و منو (اگر base.send_menu نبود)."""
+    welcome = (
+        "سلام! به ربات خوش آمدید.\n"
+        "دستورات:\n"
+        "/products  \n"
+        "/wallet  \n"
+        "اگر ادمین هستید، برای افزودن محصول بعداً گزینه ادمین اضافه می‌کنیم."
+    )
+    _fallback_send_message(chat_id, welcome)
+
+
+# رَپرهای نهایی که اولویت را به base.py می‌دهند
+def send_message(chat_id: int, text: str) -> None:
+    if _HAS_BASE_SEND and callable(globals().get("_base_send_message", None)):
+        try:
+            _base_send_message(chat_id, text)
+            return
+        except Exception as _e:
+            print("base.send_message error, using fallback:", _e)
+    _fallback_send_message(chat_id, text)
+
+
+def send_menu(chat_id: int) -> None:
+    if _HAS_BASE_SEND and callable(globals().get("_base_send_menu", None)):
+        try:
+            _base_send_menu(chat_id)
+            return
+        except Exception as _e:
+            print("base.send_menu error, using fallback:", _e)
+    _fallback_send_menu(chat_id)
+
+
+# ====== منطق اصلی هندلرها (بدون تغییر رفتاری) ======
 async def handle_update(update: Dict[str, Any]) -> None:
-    """
-    منطق همون قبلیه: /start ، /wallet ، /products
-    فقط ایمپورت‌ها اصلاح شده‌اند. send_message/send_menu فرضاً سینک هستند
-    و در تابع async بدون await صدا می‌زنیم (مثل قبل که برات کار می‌کرد).
-    """
     try:
         msg = update.get("message") or update.get("edited_message") or {}
         if not msg:
@@ -35,7 +85,7 @@ async def handle_update(update: Dict[str, Any]) -> None:
         if not (chat_id and text):
             return
 
-        # ثبت/بروزرسانی کاربر بر اساس tg_id (همان چیزی که در DB ساختیم)
+        # ثبت/بروزرسانی کاربر
         user = get_or_create_user(
             tg_id=from_user.get("id"),
             first_name=from_user.get("first_name"),
@@ -43,15 +93,12 @@ async def handle_update(update: Dict[str, Any]) -> None:
             username=from_user.get("username"),
         )
 
-        # دستورات
         if text == "/start":
-            # پیام خوش‌آمد + منو
             send_menu(chat_id)
             return
 
         if text == "/wallet":
             wallet_cents, is_admin = get_wallet(user["tg_id"])
-            # نمایش به تومان مثل قبل
             send_message(chat_id, f"موجودی کیف پول شما: {wallet_cents // 100} تومان")
             return
 
@@ -68,13 +115,12 @@ async def handle_update(update: Dict[str, Any]) -> None:
                 send_message(chat_id, "\n".join(lines))
             return
 
-        # سایر دستورات (در صورت نیاز بعداً اضافه می‌کنیم)
-        # ...
+        # جا برای دستورات بعدی…
 
     except Exception as e:
-        # فقط لاگ؛ تا سرویس لایو بماند
         print("handle_update error:", e)
 
+
 def startup_warmup() -> None:
-    # برای گرم نگه‌داشتن/لود اولیه اگر لازم شد
+    # هر کاری برای گرم‌کردن در استارتاپ—فعلاً چیزی لازم نیست
     pass
