@@ -1,20 +1,21 @@
-import os
+# src/bot.py
 from fastapi import FastAPI, Request
-
-# مهم: چون uvicorn با ماژول src اجرا می‌شود، باید از نام پکیج استفاده کنیم
-from src.handlers import handle_update
-from src.db import init_db  # فقط برای اطمینان از ساخت/به‌روز شدن جداول در استارت
+from threading import Thread
+from handlers import handle_update   # همون ایمپورت قبلی که کار می‌کرد
+from db import init_db
 
 app = FastAPI()
 
 @app.on_event("startup")
 def _startup():
-    # تلاش امن برای آماده‌سازی دیتابیس (اگر چیزی نباشد، سرویس لایو می‌ماند)
-    try:
-        init_db()
-        print("DB init OK")
-    except Exception as e:
-        print("init_db error:", e)
+    # init_db را غیرمسدودکننده اجرا می‌کنیم تا Render سریع healthcheck بگیرد
+    def _bg():
+        try:
+            init_db()
+        except Exception as e:
+            print("init_db error:", e)
+    Thread(target=_bg, daemon=True).start()
+    print("startup kicked")
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -24,4 +25,5 @@ async def webhook(request: Request):
 
 @app.get("/")
 async def root():
+    # بدون وابستگی به DB پاسخ می‌دهیم
     return {"status": "bot is running"}
