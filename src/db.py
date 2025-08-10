@@ -1,65 +1,75 @@
 # src/db.py
 import os
 import psycopg2
+from psycopg2.extras import DictCursor
 
-DDL_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-  id BIGSERIAL PRIMARY KEY,
-  tg_id BIGINT UNIQUE NOT NULL,
-  first_name TEXT,
-  last_name  TEXT,
-  username   TEXT,
-  wallet_balance NUMERIC(12,2) DEFAULT 0,
-  cashback_percent INTEGER DEFAULT 0,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS products (
-  id BIGSERIAL PRIMARY KEY,
-  title TEXT NOT NULL,
-  price NUMERIC(12,2) NOT NULL,
-  photo_file_id TEXT,
-  is_active BOOLEAN DEFAULT TRUE,
-  created_by BIGINT,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS orders (
-  id BIGSERIAL PRIMARY KEY,
-  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  total_amount NUMERIC(12,2) NOT NULL,
-  status TEXT NOT NULL DEFAULT 'pending',
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE TABLE IF NOT EXISTS order_items (
-  id BIGSERIAL PRIMARY KEY,
-  order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-  product_id BIGINT NOT NULL REFERENCES products(id),
-  quantity INTEGER NOT NULL DEFAULT 1,
-  unit_price NUMERIC(12,2) NOT NULL
-);
-CREATE TABLE IF NOT EXISTS wallet_transactions (
-  id BIGSERIAL PRIMARY KEY,
-  user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  amount NUMERIC(12,2) NOT NULL,
-  kind   TEXT NOT NULL,
-  note   TEXT,
-  created_at TIMESTAMPTZ DEFAULT now()
-);
-CREATE INDEX IF NOT EXISTS idx_users_tg_id     ON users(tg_id);
-CREATE INDEX IF NOT EXISTS idx_products_active ON products(is_active);
-CREATE INDEX IF NOT EXISTS idx_wtx_user_time   ON wallet_transactions(user_id, created_at);
-"""
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def init_db():
-    url = os.getenv("DATABASE_URL")
-    if not url:
-        print("DATABASE_URL not set; skipping DB init", flush=True)
-        return
-    try:
-        conn = psycopg2.connect(url)  # در Neon معمولاً sslmode=require داخل URL هست
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(DDL_SQL)
-        conn.close()
-        print("DB init OK", flush=True)
-    except Exception as e:
-        print("DB init error:", e, flush=True)
+# اتصال ساده؛ چون psycopg2 سنک است، در bot.py آن را داخل threadpool صدا می‌زنیم
+def get_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL env var is missing")
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=DictCursor)
+    conn.autocommit = True
+    return conn
+
+def ensure_schema():
+    """جدول‌ها اگر نبودند ساخته می‌شوند؛ اجرای امن برای چند بار پشت سر هم."""
+    conn = get_conn()
+    cur = conn.cursor()
+
+    # users
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        tg_id BIGINT UNIQUE NOT NULL,
+        username TEXT,
+        first_name TEXT,
+        wallet_balance INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+
+    # products
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS products (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        price INTEGER NOT NULL,
+        image_file_id TEXT,          -- file_id تلگرام
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+
+    # orders
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+        quantity INTEGER NOT NULL DEFAULT 1,
+        amount INTEGER NOT NULL,     -- مبلغ کل سفارش (قبل از کش‌بک)
+        cashback_applied INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    """)
+
+    cur.close()
+    conn.close()
+
+def ensure_user(tg_id: int, username: str | None, first_name: str | None):
+    """اگر کاربر وجود نداشت بساز."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id FROM users WHERE tg_id = %s;",
+        (tg_id,)
+    )
+    row = cur.fetchone()
+    if not row:
+        cur.execute(
+            "INSERT INTO users (tg_id, username, first_name) VALUES (%s, %s, %s);",
+            (tg_id, username, first_name)
+        )
+    cur.close()
+    conn.close()
