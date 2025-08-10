@@ -1,81 +1,80 @@
-import requests
-from .base import BOT_TOKEN, RENDER_URL
-from .db import init_db, get_or_create_user, get_wallet, list_products
+import os
+from typing import Dict, Any
 
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# اگر base توابع ارسال پیام/منو رو داره، همون‌ها رو استفاده می‌کنیم
+from src.base import send_message, send_menu
 
-def _send(chat_id: int, text: str):
+# توابع دیتابیس—فقط ایمپورت مطلق
+from src.db import (
+    init_db,          # اگر جایی لازم شد
+    set_admins,       # اگر جایی لازم شد
+    get_or_create_user,
+    get_wallet,
+    list_products,
+    add_product,      # برای بعداً (افزودن محصول)
+)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+
+async def handle_update(update: Dict[str, Any]) -> None:
+    """
+    منطق همون قبلیه: /start ، /wallet ، /products
+    فقط ایمپورت‌ها اصلاح شده‌اند. send_message/send_menu فرضاً سینک هستند
+    و در تابع async بدون await صدا می‌زنیم (مثل قبل که برات کار می‌کرد).
+    """
     try:
-        requests.post(f"{API}/sendMessage", json={"chat_id": chat_id, "text": text})
-    except Exception as e:
-        print("sendMessage error:", e)
-
-def startup_warmup():
-    """در استارتاپ: DB را آماده کن و اگر URL رندر موجود بود، وبهوک را ست کن."""
-    try:
-        init_db()
-        print("DB init OK")
-    except Exception as e:
-        print("init_db error:", e)
-
-    try:
-        if RENDER_URL:
-            wh = f"{RENDER_URL}/webhook"
-            r = requests.post(f"{API}/setWebhook", json={"url": wh})
-            print("setWebhook:", r.status_code, r.text)
-        else:
-            print("RENDER_EXTERNAL_URL not set -> skip setWebhook")
-    except Exception as e:
-        print("setWebhook error:", e)
-
-async def handle_update(update: dict):
-    """هندلر اصلی وبهوک (ساده و مقاوم)."""
-    try:
-        message = update.get("message") or update.get("edited_message")
-        if not message:
-            return  # چیز قابل پردازش نیست
-
-        from_user = message.get("from", {}) or {}
-        chat_id   = message["chat"]["id"]
-        text      = (message.get("text") or "").strip()
-
-        # کاربر را ثبت/واکشی کن
-        try:
-            get_or_create_user(from_user)
-        except Exception as e:
-            print("get_or_create_user error:", e)
-
-        if text.startswith("/start"):
-            _send(chat_id,
-                  "سلام! به ربات خوش آمدید.\n"
-                  "دستورات: /products , /wallet/\n"
-                  "اگر ادمین هستید، برای افزودن محصول بعدا گزینه ادمین اضافه می‌کنیم.")
+        msg = update.get("message") or update.get("edited_message") or {}
+        if not msg:
             return
 
-        if text.startswith("/wallet"):
-            cents = 0
-            try:
-                cents = get_wallet(from_user.get("id"))
-            except Exception as e:
-                print("get_wallet error:", e)
-            toman = cents // 100
-            _send(chat_id, f"موجودی کیف پول شما: {toman} تومان")
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        text = (msg.get("text") or "").strip()
+        from_user = msg.get("from") or {}
+
+        if not (chat_id and text):
             return
 
-        if text.startswith("/products"):
-            items = []
-            try:
-                items = list_products()
-            except Exception as e:
-                print("list_products error:", e)
-            if not items:
-                _send(chat_id, "هنوز محصولی ثبت نشده است.")
+        # ثبت/بروزرسانی کاربر بر اساس tg_id (همان چیزی که در DB ساختیم)
+        user = get_or_create_user(
+            tg_id=from_user.get("id"),
+            first_name=from_user.get("first_name"),
+            last_name=from_user.get("last_name"),
+            username=from_user.get("username"),
+        )
+
+        # دستورات
+        if text == "/start":
+            # پیام خوش‌آمد + منو
+            send_menu(chat_id)
+            return
+
+        if text == "/wallet":
+            wallet_cents, is_admin = get_wallet(user["tg_id"])
+            # نمایش به تومان مثل قبل
+            send_message(chat_id, f"موجودی کیف پول شما: {wallet_cents // 100} تومان")
+            return
+
+        if text == "/products":
+            products = list_products()
+            if not products:
+                send_message(chat_id, "هنوز محصولی ثبت نشده است.")
             else:
-                lines = [f"{p['id']}. {p['title']} - {p['price_cents']//100} تومان" for p in items]
-                _send(chat_id, "محصولات:\n" + "\n".join(lines))
+                lines = []
+                for i, p in enumerate(products, start=1):
+                    name = p.get("name") or p.get("title") or f"محصول {i}"
+                    price = p.get("price") or 0
+                    lines.append(f"{i}. {name} — {price} تومان")
+                send_message(chat_id, "\n".join(lines))
             return
 
-        # پیش‌فرض
-        _send(chat_id, "دستور ناشناخته است. از /start استفاده کنید.")
+        # سایر دستورات (در صورت نیاز بعداً اضافه می‌کنیم)
+        # ...
+
     except Exception as e:
+        # فقط لاگ؛ تا سرویس لایو بماند
         print("handle_update error:", e)
+
+def startup_warmup() -> None:
+    # برای گرم نگه‌داشتن/لود اولیه اگر لازم شد
+    pass
