@@ -1,171 +1,213 @@
+# src/db.py
 import os
+import time
+import threading
+from typing import List, Dict, Optional, Tuple
+
+DB_URL = os.getenv("DATABASE_URL", "").strip()
+
+# دو درایور برای fallback
 import sqlite3
-from contextlib import contextmanager
-
-USE_PG = False
-PG_URL = os.getenv("DATABASE_URL", "").strip()
-
-# اگر DATABASE_URL ست شده بود به Postgres وصل می‌شیم
 try:
-    if PG_URL.startswith("postgres://") or PG_URL.startswith("postgresql://"):
-        import psycopg2  # type: ignore
-        USE_PG = True
-except Exception:
-    USE_PG = False
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except Exception:  # روی بیلد هم اگر در دسترس نبود، مشکلی نشود
+    psycopg2 = None
+    RealDictCursor = None
+
+# وضعیت اتصال
+_DB_KIND = None  # "pg" | "sqlite" | None
+_CONN = None
+_LOCK = threading.Lock()
 
 
-def _connect_pg():
-    # psycopg2 خودش اتو-کمیت نمی‌کند؛ خودمان commit می‌کنیم
-    return psycopg2.connect(PG_URL)
+def _pg_connect():
+    assert psycopg2 is not None, "psycopg2 not installed"
+    # connect_timeout برای جلوگیری از Timeout
+    conn = psycopg2.connect(DB_URL, connect_timeout=3, sslmode="require")
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        # محدودیت برای کوئری‌های طولانی
+        try:
+            cur.execute("SET statement_timeout TO 3000;")
+        except Exception:
+            pass
+    return conn
 
-def _connect_sqlite():
-    # یک فایل ساده محلی (فالبک امن)
-    path = os.path.join(os.path.dirname(__file__), "bot.db")
+
+def _sqlite_connect():
+    # فایل در /tmp تا روی Render قابل نوشتن باشد
+    path = "/tmp/app.db"
     conn = sqlite3.connect(path, check_same_thread=False)
     return conn
 
-@contextmanager
-def get_conn():
-    conn = _connect_pg() if USE_PG else _connect_sqlite()
-    try:
-        yield conn
-        conn.commit()
-    finally:
+
+def _ensure_connection():
+    """تنها زمانی که نیاز شد وصل می‌شویم (lazy)"""
+    global _CONN, _DB_KIND
+    with _LOCK:
+        if _CONN:
+            return
+
+        # ابتدا تلاش برای Postgres (Neon)
+        if DB_URL and psycopg2:
+            try:
+                _CONN = _pg_connect()
+                _DB_KIND = "pg"
+                print("DB: connected to Postgres")
+                return
+            except Exception as e:
+                print("DB: Postgres connect failed ->", e)
+
+        # fallback: SQLite
+        _CONN = _sqlite_connect()
+        _DB_KIND = "sqlite"
+        print("DB: connected to SQLite at /tmp/app.db")
+
+
+def _exec(sql: str, params: Tuple = ()):
+    _ensure_connection()
+    if _DB_KIND == "pg":
+        with _CONN.cursor() as cur:
+            cur.execute(sql, params)
+            # اگر نیاز به نتیجه نباشد، چیزی برنمی‌گردانیم
+    else:
+        cur = _CONN.cursor()
         try:
-            conn.close()
-        except Exception:
-            pass
-
-def _ph(n=1):
-    """
-    placeholder ساز: در PG از %s و در sqlite از ? استفاده می‌کنیم.
-    """
-    return ", ".join(["%s" if USE_PG else "?" for _ in range(n)])
+            cur.execute(sql, params)
+            _CONN.commit()
+        finally:
+            cur.close()
 
 
-# ---------- Bootstrap / Migrations ساده ----------
+def _fetchone(sql: str, params: Tuple = ()) -> Optional[Tuple]:
+    _ensure_connection()
+    if _DB_KIND == "pg":
+        with _CONN.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchone()
+    else:
+        cur = _CONN.cursor()
+        try:
+            cur.execute(sql, params)
+            return cur.fetchone()
+        finally:
+            cur.close()
+
+
+def _fetchall(sql: str, params: Tuple = ()) -> List[Tuple]:
+    _ensure_connection()
+    if _DB_KIND == "pg":
+        with _CONN.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    else:
+        cur = _CONN.cursor()
+        try:
+            cur.execute(sql, params)
+            return cur.fetchall()
+        finally:
+            cur.close()
+
+
+# ---------- Schema & public functions ----------
+
 def init_db():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        # users
-        if USE_PG:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                tg_id BIGINT PRIMARY KEY,
-                wallet_cents INTEGER DEFAULT 0,
-                is_admin BOOLEAN DEFAULT FALSE
-            );
-            """)
-            # اگر قبلاً جدول بوده ولی بعضی ستون‌ها نبودند
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_cents INTEGER DEFAULT 0;")
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN DEFAULT FALSE;")
-        else:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                tg_id INTEGER PRIMARY KEY,
-                wallet_cents INTEGER DEFAULT 0,
-                is_admin INTEGER DEFAULT 0
-            );
-            """)
-            # تلاش برای اضافه کردن ستون‌ها (اگر وجود داشته باشند خطا را نادیده می‌گیریم)
-            try:
-                cur.execute("ALTER TABLE users ADD COLUMN wallet_cents INTEGER DEFAULT 0;")
-            except Exception:
-                pass
-            try:
-                cur.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0;")
-            except Exception:
-                pass
+    """
+    ساخت جداول در صورت نبودن.
+    سریع است و اگر Neon کند باشد، قبلاً اتصال fallback شده.
+    """
+    _ensure_connection()
 
-        # products
-        if USE_PG:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id SERIAL PRIMARY KEY,
-                title TEXT NOT NULL,
-                price_cents INTEGER NOT NULL,
-                image_file_id TEXT
-            );
-            """)
-        else:
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS products (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                price_cents INTEGER NOT NULL,
-                image_file_id TEXT
-            );
-            """)
+    if _DB_KIND == "pg":
+        _exec("""
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGSERIAL PRIMARY KEY,
+            tg_id BIGINT UNIQUE,
+            wallet_cents INTEGER DEFAULT 0,
+            is_admin BOOLEAN DEFAULT FALSE
+        );
+        """)
+        _exec("""
+        CREATE TABLE IF NOT EXISTS products (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            price_cents INTEGER NOT NULL,
+            photo_file_id TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+    else:
+        _exec("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_id INTEGER UNIQUE,
+            wallet_cents INTEGER DEFAULT 0,
+            is_admin INTEGER DEFAULT 0
+        );
+        """)
+        _exec("""
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            price_cents INTEGER NOT NULL,
+            photo_file_id TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+        """)
+
+    print("DB: init_db done")
 
 
-# ---------- کاربران ----------
-def get_or_create_user(tg_id: int, is_admin: bool = False):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT tg_id, wallet_cents, { 'is_admin' if USE_PG else 'is_admin' } FROM users WHERE tg_id={_ph(1)}",
-            (tg_id,),
-        )
-        row = cur.fetchone()
-        if row:
-            # row: (tg_id, wallet_cents, is_admin)
-            return {"tg_id": int(row[0]), "wallet_cents": int(row[1]), "is_admin": bool(row[2])}
+def get_or_create_user(tg_id: int) -> Tuple[int, int, bool]:
+    """
+    برمی‌گرداند: (id, wallet_cents, is_admin)
+    """
+    row = _fetchone("SELECT id, wallet_cents, is_admin FROM users WHERE tg_id=%s" if _DB_KIND == "pg"
+                    else "SELECT id, wallet_cents, is_admin FROM users WHERE tg_id=?",
+                    (tg_id,))
+    if row:
+        uid, wallet, is_admin = row
+        # در SQLite is_admin عدد است
+        if isinstance(is_admin, int):
+            is_admin = bool(is_admin)
+        return uid, wallet, is_admin
 
-        # ایجاد
-        if USE_PG:
-            cur.execute(
-                f"INSERT INTO users (tg_id, wallet_cents, is_admin) VALUES ({_ph(3)}) RETURNING tg_id, wallet_cents, is_admin",
-                (tg_id, 0, is_admin),
-            )
-            r = cur.fetchone()
-            return {"tg_id": int(r[0]), "wallet_cents": int(r[1]), "is_admin": bool(r[2])}
-        else:
-            cur.execute(
-                f"INSERT INTO users (tg_id, wallet_cents, is_admin) VALUES ({_ph(3)})",
-                (tg_id, 0, 1 if is_admin else 0),
-            )
-            return {"tg_id": tg_id, "wallet_cents": 0, "is_admin": is_admin}
+    # ایجاد کاربر
+    _exec("INSERT INTO users (tg_id) VALUES (%s)" if _DB_KIND == "pg" else "INSERT INTO users (tg_id) VALUES (?)",
+          (tg_id,))
+    row = _fetchone("SELECT id, wallet_cents, is_admin FROM users WHERE tg_id=%s" if _DB_KIND == "pg"
+                    else "SELECT id, wallet_cents, is_admin FROM users WHERE tg_id=?",
+                    (tg_id,))
+    uid, wallet, is_admin = row
+    if isinstance(is_admin, int):
+        is_admin = bool(is_admin)
+    return uid, wallet, is_admin
+
 
 def get_wallet(tg_id: int) -> int:
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT wallet_cents FROM users WHERE tg_id={_ph(1)}",
-            (tg_id,),
-        )
-        row = cur.fetchone()
-        return int(row[0]) if row else 0
-
-def update_wallet(tg_id: int, delta_cents: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        if USE_PG:
-            cur.execute(
-                f"UPDATE users SET wallet_cents = wallet_cents + {_ph(1)} WHERE tg_id={_ph(1)}",
-                (delta_cents, tg_id),
-            )
-        else:
-            cur.execute(
-                f"UPDATE users SET wallet_cents = wallet_cents + {_ph(1)} WHERE tg_id={_ph(1)}",
-                (delta_cents, tg_id),
-            )
+    row = _fetchone("SELECT wallet_cents FROM users WHERE tg_id=%s" if _DB_KIND == "pg"
+                    else "SELECT wallet_cents FROM users WHERE tg_id=?",
+                    (tg_id,))
+    return int(row[0]) if row else 0
 
 
-# ---------- محصولات ----------
-def add_product(title: str, price_cents: int, image_file_id: str | None):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            f"INSERT INTO products (title, price_cents, image_file_id) VALUES ({_ph(3)})",
-            (title, price_cents, image_file_id),
-        )
+def list_products() -> List[Dict]:
+    rows = _fetchall("SELECT id, name, price_cents, photo_file_id FROM products ORDER BY id DESC")
+    return [
+        {"id": r[0], "name": r[1], "price_cents": int(r[2]), "photo_file_id": r[3]}
+        for r in rows
+    ]
 
-def list_products():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, title, price_cents, image_file_id FROM products ORDER BY id DESC;")
-        rows = cur.fetchall() or []
-        return [
-            {"id": int(r[0]), "title": r[1], "price_cents": int(r[2]), "image_file_id": r[3]}
-            for r in rows
-        ]
+
+def add_product(name: str, price_cents: int, photo_file_id: Optional[str]) -> int:
+    if _DB_KIND == "pg":
+        _exec("INSERT INTO products (name, price_cents, photo_file_id) VALUES (%s,%s,%s)",
+              (name, price_cents, photo_file_id))
+        row = _fetchone("SELECT id FROM products ORDER BY id DESC LIMIT 1")
+        return int(row[0])
+    else:
+        _exec("INSERT INTO products (name, price_cents, photo_file_id) VALUES (?,?,?)",
+              (name, price_cents, photo_file_id))
+        row = _fetchone("SELECT last_insert_rowid()")
+        return int(row[0])
