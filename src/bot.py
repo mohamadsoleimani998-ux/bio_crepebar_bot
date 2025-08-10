@@ -1,40 +1,59 @@
 # src/bot.py
 import os
-import json
 from fastapi import FastAPI, Request
-from starlette.concurrency import run_in_threadpool
+from typing import Any, Dict
 
-from handlers import handle_update
-from db import ensure_schema, ensure_user
+# وارد کردن نسبی از داخل پکیج src
+from .handlers import handle_update
+from .db import ensure_schema
 
 app = FastAPI()
 
-# هنگام بالا آمدن سرویس، اسکیما را می‌سازیم (ایمن و بدون قطع سرویس)
+
 @app.on_event("startup")
-async def _startup():
-    await run_in_threadpool(ensure_schema)
-
-@app.post(f"/{{os.getenv('BOT_TOKEN')}}")
-async def webhook(request: Request):
-    update = await request.json()
-
-    # قبل از پاسخ، کاربر را در DB ایمن می‌کنیم (بدون بلاک کردن loop)
+async def on_startup() -> None:
+    """
+    هنگام بالا آمدن سرویس:
+    - اسکیمای دیتابیس را (اگر لازم بود) می‌سازد/به‌روز می‌کند.
+    """
     try:
-        if "message" in update and "from" in update["message"]:
-            f = update["message"]["from"]
-            await run_in_threadpool(
-                ensure_user,
-                int(f["id"]),
-                f.get("username"),
-                f.get("first_name")
-            )
-    except Exception:
-        # اگر DB در دسترس نبود، اجازه نمی‌دهیم پاسخ‌دهی تلگرام قطع شود.
-        pass
+        await ensure_schema()
+    except Exception as e:
+        # لاگ ساده؛ Render لاگ‌ها را نشان می‌دهد
+        print(f"[startup] ensure_schema error: {e}")
 
-    await handle_update(update)
+
+@app.post("/{token}")
+async def webhook_with_token(token: str, request: Request) -> Dict[str, Any]:
+    """
+    وبهوک با مسیر شامل توکن.
+    اگر توکن با BOT_TOKEN یکی نبود، درخواست نادیده گرفته می‌شود.
+    """
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token or token != bot_token:
+        return {"ok": True}  # بی‌صدا نادیده بگیر
+
+    update = await request.json()
+    try:
+        await handle_update(update)
+    except Exception as e:
+        print(f"[webhook_with_token] handle_update error: {e}")
     return {"ok": True}
 
+
+@app.post("/webhook")
+async def webhook_plain(request: Request) -> Dict[str, Any]:
+    """
+    وبهوک ساده برای زمانی که آدرس `/webhook` ست شده.
+    """
+    update = await request.json()
+    try:
+        await handle_update(update)
+    except Exception as e:
+        print(f"[webhook_plain] handle_update error: {e}")
+    return {"ok": True}
+
+
 @app.get("/")
-async def root():
+async def root() -> Dict[str, Any]:
     return {"status": "bot is running"}
