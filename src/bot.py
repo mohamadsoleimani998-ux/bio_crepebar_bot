@@ -1,28 +1,28 @@
-import json
+import os
 from fastapi import FastAPI, Request
 
-# ایمپورت نسبی تا در محیط پکیجی درست کار کند
+# نکته مهم: ایمپورت نسبی تا دیگر خطای ModuleNotFound نگیریم
 from .handlers import handle_update, startup_warmup
+from .db import init_db
 
 app = FastAPI()
 
 
 @app.on_event("startup")
-def _startup():
-    """
-    در شروع سرویس: اسکیما را می‌سازد (اگر نبود)،
-    ادمین‌ها را علامت‌گذاری می‌کند.
-    """
+async def _startup():
+    """اپ راه می‌افته؛ دیتابیس ایمن آماده می‌شود و وارم‌آپ سبک انجام می‌دهیم."""
     try:
-        startup_warmup()
-        print("Startup warmup OK")
+        init_db()           # اگر جداول/ستون‌ها باشند، تغییری نمی‌دهد
+        await startup_warmup()
+        print("startup OK")
     except Exception as e:
-        # اگر هم خطا باشد، سرویس لایو می‌ماند و فقط لاگ می‌دهیم
-        print("startup_warmup error:", e)
+        # ربات لایو می‌ماند، جزئیات در لاگ
+        print("startup error:", e)
 
 
 @app.post("/webhook")
 async def webhook(request: Request):
+    """ورودی وبهوک تلگرام را می‌گیرد و به هندلر می‌دهد."""
     update = await request.json()
     await handle_update(update)
     return {"ok": True}
