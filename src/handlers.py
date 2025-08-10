@@ -1,212 +1,194 @@
-import os
-import asyncio
-from typing import Any, Dict, Optional
-
-import requests
+# src/handlers.py
+from typing import Dict, Any, Optional
 
 # =========================
-# تلاش برای استفاده از ارسال آماده در base.py (اگر موجود باشد)
+# ایمپورت‌های لایه Base
 # =========================
-_HAS_BASE_SEND = False
+# این‌ها باید وجود داشته باشند و قبلاً کار می‌کردند
+from src.base import send_message, send_menu  # ← همین‌هایی که دارید
+
+# set_my_commands ممکن است در base نباشد؛ اگر نبود، نال-اپ بگذاریم
 try:
-    from src.base import send_message as _base_send_message
-    from src.base import send_menu as _base_send_menu
-    _HAS_BASE_SEND = True
+    from src.base import set_my_commands
 except Exception:
-    _HAS_BASE_SEND = False
+    def set_my_commands(*args, **kwargs):
+        # no-op
+        return None
+
 
 # =========================
-# ایمپورت‌های دیتابیس (الزامی‌ها)
+# ایمپورت‌های دیتابیس
 # =========================
-from src.db import get_or_create_user, get_wallet, list_products, add_product
 
-# =========================
-# ایمپورت‌های دیتابیس (اختیاری‌ها: اگر نبودند، جایگزین خنثی)
-# =========================
+# الزامـی‌ها: اگر نبودند، بگذارید خطا بده تا سریع متوجه شویم
+from src.db import get_or_create_user, get_wallet, list_products  # ← همین‌هایی که قبلاً بود
+
+# اختیاری‌ها: اگر در db.py تعریف نشده باشند، نسخه‌ی امن بگذار
 try:
-    from src.db import set_admins  # ممکن است در db.py تعریف نشده باشد
+    from src.db import add_product
 except Exception:
-    def set_admins(*args, **kwargs):
+    def add_product(*_args, **_kwargs):
+        print("WARN: add_product تعریف نشده است (db.py).")
         return None
 
 try:
-    from src.db import init_db  # ممکن است وجود نداشته باشد
+    from src.db import set_admins
+except Exception:
+    def set_admins(*_args, **_kwargs):
+        # نال-اپ: نبودنش نباید سرویس را بخواباند
+        return None
+
+try:
+    from src.db import init_db
 except Exception:
     def init_db():
+        # نال-اپ
         return None
 
+
 # =========================
-# تنظیمات تلگرام
+# ابزارهای کمکی داخلی
 # =========================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-BASE_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}" if TELEGRAM_TOKEN else ""
+def _get_msg(update: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    return update.get("message") or update.get("edited_message")
 
-def _http_send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
-    """ارسال پیام با استفاده از Telegram Bot API (وقتی base.py نداریم)."""
-    if not BASE_URL:
-        print("WARN: TELEGRAM_BOT_TOKEN تنظیم نشده؛ پیام ارسال نشد.")
-        return
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-    try:
-        r = requests.post(f"{BASE_URL}/sendMessage", json=payload, timeout=15)
-        if r.status_code >= 300:
-            print("sendMessage error:", r.status_code, r.text)
-    except Exception as e:
-        print("sendMessage exception:", e)
+def _txt(msg: Dict[str, Any]) -> str:
+    return (msg.get("text") or "").strip()
 
-def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
-    """رَپر واحد برای ارسال پیام؛ اولویت با base.py اگر باشد."""
-    if _HAS_BASE_SEND:
-        try:
-            return _base_send_message(chat_id, text, reply_markup=reply_markup)
-        except Exception as e:
-            print("base.send_message failed, fallback http:", e)
-    return _http_send_message(chat_id, text, reply_markup)
+def _chat_id(msg: Dict[str, Any]) -> int:
+    # هم برای private و هم group درست کار می‌کند
+    return msg.get("chat", {}).get("id")
 
-def _default_menu_markup() -> Dict[str, Any]:
-    """کیبورد ساده با تب/دکمه‌های اصلی."""
+def _user_fields(msg: Dict[str, Any]) -> Dict[str, Any]:
+    u = msg.get("from", {}) or {}
     return {
-        "keyboard": [
-            [{"text": "/products"}, {"text": "/wallet"}],
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
+        "tg_id": u.get("id"),
+        "first_name": u.get("first_name"),
+        "last_name": u.get("last_name"),
+        "username": u.get("username"),
     }
 
-def send_menu(chat_id: int):
-    """ارسال منوی اصلی؛ اگر base موجود بود همان را صدا می‌زنیم."""
-    if _HAS_BASE_SEND:
-        try:
-            return _base_send_menu(chat_id)
-        except Exception as e:
-            print("base.send_menu failed, fallback http:", e)
-    return send_message(chat_id, "گزینه‌ها:", reply_markup=_default_menu_markup())
 
 # =========================
-# هَندل اصلی آپدیت‌ها
+# راه‌اندازی سبک (اختیاری)
 # =========================
-async def handle_update(update: Dict[str, Any]):
+async def startup_warmup() -> None:
     """
-    هندل ساده برای پیام‌های متنی:
-    - /start
-    - /products
-    - /wallet
-    سایر پیام‌ها نادیده گرفته می‌شوند.
+    صدا زده می‌شود موقع بالا آمدن سرویس.
+    اگر set_my_commands داشته باشید، لیست کامندها را روی تلگرام می‌نشیند.
+    نبودنش هم مشکلی ایجاد نمی‌کند.
     """
     try:
-        msg = update.get("message") or update.get("edited_message")
+        set_my_commands([
+            ("/start", "شروع"),
+            ("/products", "دیدن محصولات"),
+            ("/wallet", "کیف پول"),
+        ])
+    except Exception as e:
+        print("startup_warmup warning:", e)
+
+
+# =========================
+# هندلر اصلی آپدیت
+# =========================
+async def handle_update(update: Dict[str, Any]) -> None:
+    """
+    فقط چیزهای لازم را انجام می‌دهد و اگر تابعی در db نبود،
+    با نال-اپ‌ها سرویس را سرپا نگه می‌داریم.
+    """
+    try:
+        msg = _get_msg(update)
         if not msg:
             return
 
-        chat = msg.get("chat") or {}
-        chat_id = chat.get("id")
-        if not chat_id:
-            return
+        chat_id = _chat_id(msg)
+        fields = _user_fields(msg)
+        tg_id = fields["tg_id"]
 
-        text = (msg.get("text") or "").strip()
-
-        # ساخت/خواندن کاربر
-        from_user = msg.get("from") or {}
-        tg_id = from_user.get("id")
-        first_name = from_user.get("first_name")
-        last_name = from_user.get("last_name")
-        username = from_user.get("username")
-
-        # توجه: امضای get_or_create_user باید با db.py خودت سازگار باشد
+        # کاربر را بساز/بگیر (الزامی است)
         try:
             get_or_create_user(
                 tg_id=tg_id,
-                first_name=first_name,
-                last_name=last_name,
-                username=username,
+                first_name=fields["first_name"],
+                last_name=fields["last_name"],
+                username=fields["username"],
             )
-        except TypeError:
-            # اگر امضای تابع شما متفاوت است، تلاش ساده‌تر:
-            try:
-                get_or_create_user(tg_id)
-            except Exception:
-                pass
+        except Exception as e:
+            # اگر این خطا بدهد بهتر است در لاگ ببینیم
+            print("get_or_create_user error:", e)
 
+        text = _txt(msg)
+
+        # ------------------ دستورات متنی
         if text == "/start":
-            welcome = (
+            hello = (
                 "سلام! به ربات خوش آمدید.\n"
                 "دستورات: /products , /wallet\n"
-                "اگر ادمین هستید، برای افزودن محصول یک عکس با کپشن بفرستید."
+                "اگر ادمین هستید، برای افزودن محصول بعداً گزینه ادمین اضافه می‌کنیم."
             )
-            await asyncio.to_thread(send_message, chat_id, welcome, _default_menu_markup())
-            await asyncio.to_thread(send_menu, chat_id)
+            await send_message(chat_id, hello)
+            await send_menu(chat_id)  # اگر در base پیاده‌سازی شده باشد
+
             return
 
         if text == "/products":
             try:
-                products = list_products()
+                items = list_products()
             except Exception as e:
                 print("list_products error:", e)
-                products = []
+                items = []
 
-            if not products:
-                await asyncio.to_thread(send_message, chat_id, "هنوز محصولی ثبت نشده است.", _default_menu_markup())
+            if not items:
+                await send_message(chat_id, "هنوز محصولی ثبت نشده است.")
             else:
+                # نمایش بسیار ساده
                 lines = []
-                for p in products:
-                    # انعطاف: p می‌تواند dict یا tuple باشد
-                    if isinstance(p, dict):
-                        name = p.get("name") or p.get("title") or "محصول"
-                        price = p.get("price") or p.get("amount") or 0
+                for it in items:
+                    # تلاش برای خواندن فیلدهای متداول؛ اگر نبودند، به شکل safe چاپ می‌کنیم
+                    name = getattr(it, "name", None) or it.get("name") if isinstance(it, dict) else str(it)
+                    price = getattr(it, "price", None) or (it.get("price") if isinstance(it, dict) else None)
+                    if price is not None:
+                        lines.append(f"- {name} | {price}")
                     else:
-                        # tuple: (id,name,price,...) یا مشابه
-                        name = str(p[1]) if len(p) > 1 else "محصول"
-                        price = p[2] if len(p) > 2 else 0
-                    lines.append(f"• {name} — {price} تومان")
-                await asyncio.to_thread(send_message, chat_id, "\n".join(lines), _default_menu_markup())
+                        lines.append(f"- {name}")
+                await send_message(chat_id, "\n".join(lines) or "لیست خالی است.")
             return
 
         if text == "/wallet":
             try:
-                balance = get_wallet(tg_id)
-            except TypeError:
-                balance = get_wallet()
+                cents = get_wallet(tg_id)
             except Exception as e:
                 print("get_wallet error:", e)
-                balance = 0
-            await asyncio.to_thread(send_message, chat_id, f"موجودی کیف پول شما: {balance} تومان", _default_menu_markup())
+                cents = 0
+            # اگر get_wallet ریال/تومان می‌دهد، همین را چاپ می‌کنیم
+            await send_message(chat_id, f"موجودی کیف پول شما: {cents} تومان")
             return
 
-        # افزودن محصول برای ادمین‌ها (الگوی ساده: عکس با کپشن)
+        # ------------------ افزودن محصول (نمایش نمونه‌ی ساده؛ فقط اگر add_product واقعی دارید)
+        # اگر پیام عکس با کپشن بود و شما بعداً چک ادمین گذاشتید، اینجا صدا بزنید
         if "photo" in msg and msg.get("caption"):
-            caption = (msg.get("caption") or "").strip()
-            # انتظار نام و قیمت در کپشن (به دلخواه خودت؛ فعلاً فقط نام)
-            try:
-                add_product(caption)
-                await asyncio.to_thread(send_message, chat_id, "محصول اضافه شد ✅", _default_menu_markup())
-            except Exception as e:
-                print("add_product error:", e)
-                await asyncio.to_thread(send_message, chat_id, "افزودن محصول ناموفق بود.", _default_menu_markup())
+            caption = msg["caption"].strip()
+            # صرفاً نمونه: اگر کپشن با + شروع شود، تلاش برای افزودن محصول
+            if caption.startswith("+"):
+                try:
+                    # فراخوانی امن؛ امضای واقعی add_product هرچه باشد، اینجا خطا نمی‌دهد
+                    add_product(tg_id=tg_id, caption=caption, photo=msg["photo"][-1]["file_id"])
+                    await send_message(chat_id, "درخواست افزوده شدن محصول ثبت شد.")
+                except Exception as e:
+                    print("add_product error:", e)
+                    await send_message(chat_id, "ثبت محصول انجام نشد.")
             return
 
-        # سایر پیام‌ها
-        await asyncio.to_thread(send_message, chat_id, "دستور نامعتبر است.", _default_menu_markup())
+        # پیام‌های دیگر را فعلاً نادیده بگیر
+        return
 
     except Exception as e:
-        # لاگ خطای کلی اما اجازه می‌دهیم سرویس لایو بماند
+        # هیچ‌وقت نگذارید استثناء باعث کرش پروسه شود
         print("handle_update error:", e)
-
-# =========================
-# استارتاپ وارم‌آپ (فراخوانی از bot.py)
-# =========================
-def startup_warmup():
-    """برای آماده‌سازی اولیه: ساخت جداول/ستون‌ها اگر لازم است."""
-    try:
-        init_db()
-        # اگر set_admins تعریف شده بود، می‌توانی اینجا لیست اولیه بدهی:
-        set_admins()  # نسخه‌ی خنثی چیزی انجام نمی‌دهد
-        print("startup_warmup OK")
-    except Exception as e:
-        print("startup_warmup error:", e)
+        try:
+            # اگر شد به کاربر هم خطا ندهیم، اما برای دیباگ مفید است
+            chat_id = _chat_id(_get_msg(update) or {})
+            if chat_id:
+                await send_message(chat_id, "یک خطای موقتی رخ داد.")
+        except Exception:
+            pass
