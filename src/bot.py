@@ -1,27 +1,18 @@
-import os
-import json
 from fastapi import FastAPI, Request
-
-# ایمپورت‌های داخلی با پیشوند پکیج
 from src.handlers import handle_update, startup_warmup
-from src.db import init_db
+# اگر لازم شد:
+# from src.db import init_db
 
 app = FastAPI()
 
 @app.on_event("startup")
-def _startup():
-    # ساخت/آپدیت امن جداول
+async def _startup():
     try:
-        init_db()
-        print("DB init OK")
+        # init_db()
+        await startup_warmup()
+        print("startup OK")
     except Exception as e:
-        print("init_db error:", e)
-
-    # هر کار گرم‌کن اختیاری
-    try:
-        startup_warmup()
-    except Exception as e:
-        print("startup_warmup error:", e)
+        print("startup warn:", e)
 
 @app.post("/webhook")
 async def webhook(request: Request):
