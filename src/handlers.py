@@ -1,28 +1,43 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import Message
 import os
 from dotenv import load_dotenv
-from .handlers import handle_update, startup_warmup
-from .db import init_db
+from .db import (
+    init_db, set_admins, get_or_create_user, get_wallet, list_products, add_product
+)
 
 load_dotenv()
 
-app = FastAPI()
+TOKEN = os.getenv("BOT_TOKEN")
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
-@app.on_event("startup")
-async def startup():
-    await init_db()
-    await startup_warmup()
+async def handle_update(update: dict):
+    tg_update = types.Update.to_object(update)
+    await dp.process_update(tg_update)
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    try:
-        update = await request.json()
-        await handle_update(update)
-        return JSONResponse(content={"ok": True})
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+async def startup_warmup():
+    await set_admins()
 
-@app.get("/")
-async def root():
-    return {"status": "ok"}
+@dp.message_handler(commands=['start'])
+async def cmd_start(message: Message):
+    user = await get_or_create_user(
+        tg_id=message.from_user.id,
+        first_name=message.from_user.first_name,
+        last_name=message.from_user.last_name
+    )
+    await message.answer(f"سلام {user.first_name}، خوش اومدی!")
+
+@dp.message_handler(commands=['wallet'])
+async def cmd_wallet(message: Message):
+    wallet = await get_wallet(message.from_user.id)
+    await message.answer(f"موجودی کیف پول شما: {wallet.balance} تومان")
+
+@dp.message_handler(commands=['products'])
+async def cmd_products(message: Message):
+    products = await list_products()
+    if not products:
+        await message.answer("هیچ محصولی ثبت نشده است.")
+    else:
+        text = "\n".join([f"{p.name} - {p.price} تومان" for p in products])
+        await message.answer(text)
