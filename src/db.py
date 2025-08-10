@@ -1,106 +1,99 @@
+# src/db.py
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+def _conn():
+    return psycopg2.connect(DATABASE_URL)
 
 def init_db():
-    with get_conn() as conn:
+    """ایمن اجرا می‌شود؛ جدول‌ها را می‌سازد و نام ستون tg_id را به user_id مهاجرت می‌دهد."""
+    with _conn() as conn:
         with conn.cursor() as cur:
+            # ساخت جدول users اگر نبود
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
-                    tg_id BIGINT PRIMARY KEY,
-                    wallet_cents INT NOT NULL DEFAULT 0,
-                    is_admin BOOLEAN NOT NULL DEFAULT FALSE
+                    user_id      BIGINT PRIMARY KEY,
+                    username     TEXT,
+                    full_name    TEXT,
+                    wallet_cents INTEGER NOT NULL DEFAULT 0,
+                    is_admin     BOOLEAN NOT NULL DEFAULT FALSE
                 );
             """)
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_id BIGINT;")
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_cents INT NOT NULL DEFAULT 0;")
-            cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;")
-            cur.execute("""
-                DO $$
-                BEGIN
-                    IF NOT EXISTS (
-                        SELECT 1 FROM pg_indexes
-                        WHERE tablename = 'users' AND indexname = 'users_tg_id_uq'
-                    ) THEN
-                        CREATE UNIQUE INDEX users_tg_id_uq ON users(tg_id);
-                    END IF;
-                END $$;
-            """)
-
+            # ساخت جدول products اگر نبود
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS products (
                     id SERIAL PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    price_cents INT NOT NULL,
-                    caption TEXT,
+                    name TEXT NOT NULL,
+                    price_cents INTEGER NOT NULL,
+                    description TEXT,
                     photo_file_id TEXT
                 );
             """)
+            # اگر قبلاً ستونی به نام tg_id بوده و user_id نیست، رینیم کن
+            cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name='users';
+            """)
+            cols = {r[0] for r in cur.fetchall()}
+            if "tg_id" in cols and "user_id" not in cols:
+                cur.execute('ALTER TABLE users RENAME COLUMN tg_id TO user_id;')
+            # اگر هر دلیلی user_id nullable شده بود، not null کن
+            cur.execute("""
+                ALTER TABLE users
+                ALTER COLUMN user_id SET NOT NULL;
+            """)
 
-def get_or_create_user(tg_id: int):
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT tg_id, wallet_cents, is_admin FROM users WHERE tg_id=%s;",
-                (tg_id,),
-            )
-            row = cur.fetchone()
-            if row is None:
-                cur.execute(
-                    "INSERT INTO users (tg_id) VALUES (%s) ON CONFLICT (tg_id) DO NOTHING;",
-                    (tg_id,),
-                )
-                cur.execute(
-                    "SELECT tg_id, wallet_cents, is_admin FROM users WHERE tg_id=%s;",
-                    (tg_id,),
-                )
-                row = cur.fetchone()
-            return row
-
-def get_wallet(tg_id: int) -> int:
-    with get_conn() as conn:
+def set_admins(admin_ids):
+    """لیست ادمین‌ها را ست می‌کند (اگر کاربر وجود نداشت می‌سازد)."""
+    if not admin_ids:
+        return
+    with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT wallet_cents FROM users WHERE tg_id=%s;", (tg_id,))
-            r = cur.fetchone()
-            return int(r[0]) if r else 0
+            for aid in admin_ids:
+                cur.execute("""
+                    INSERT INTO users (user_id, is_admin)
+                    VALUES (%s, TRUE)
+                    ON CONFLICT (user_id) DO UPDATE SET is_admin=EXCLUDED.is_admin;
+                """, (int(aid),))
 
-def list_products():
-    with get_conn() as conn:
+def get_or_create_user(user_id: int, username: str = None, full_name: str = None):
+    """اگر کاربر نبود می‌سازد. از NULL برای user_id جلوگیری می‌کند."""
+    if user_id is None:
+        raise ValueError("user_id is None")
+
+    with _conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, title, price_cents, caption, photo_file_id
-                FROM products
-                ORDER BY id DESC;
-            """)
+                INSERT INTO users (user_id, username, full_name)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE
+                SET username = COALESCE(EXCLUDED.username, users.username),
+                    full_name = COALESCE(EXCLUDED.full_name, users.full_name)
+                RETURNING user_id, username, full_name, wallet_cents, is_admin;
+            """, (int(user_id), username, full_name))
+            return cur.fetchone()
+
+def get_wallet(user_id: int) -> int:
+    with _conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT wallet_cents FROM users WHERE user_id=%s;", (int(user_id),))
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+
+def list_products():
+    with _conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT id, name, price_cents, description FROM products ORDER BY id DESC;")
             return cur.fetchall()
 
-def add_product(title: str, price_cents: int, caption: str | None, photo_file_id: str | None):
-    with get_conn() as conn:
+def add_product(name: str, price_cents: int, description: str = None, photo_file_id: str = None):
+    with _conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO products (title, price_cents, caption, photo_file_id)
+            cur.execute("""
+                INSERT INTO products (name, price_cents, description, photo_file_id)
                 VALUES (%s, %s, %s, %s);
-                """,
-                (title, price_cents, caption, photo_file_id),
-            )
-
-# تابعی که هندلر انتظار دارد
-def set_admins(admin_ids: list[int]):
-    """کاربرانی که در لیست هستند را ادمین می‌کند، بقیه را غیر ادمین."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # همه را غیر ادمین کن
-            cur.execute("UPDATE users SET is_admin=FALSE;")
-            # این‌ها را ادمین کن
-            for tg_id in admin_ids:
-                cur.execute("""
-                    INSERT INTO users (tg_id, is_admin)
-                    VALUES (%s, TRUE)
-                    ON CONFLICT (tg_id) DO UPDATE SET is_admin=TRUE;
-                """, (tg_id,))
+            """, (name, int(price_cents), description, photo_file_id))
