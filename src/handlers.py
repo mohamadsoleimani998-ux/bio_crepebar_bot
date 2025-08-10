@@ -1,11 +1,11 @@
-from base import send_message
+from src.base import send_message  # اصلاح ایمپورت
 
-async def handle_update(update: dict):
-    if "message" in update and "text" in update["message"]:
+async def handle_update(update):
+    if "message" in update:
         chat_id = update["message"]["chat"]["id"]
-        text = update["message"]["text"].strip()
+        text = update["message"].get("text", "")
 
         if text == "/start":
-            await send_message(chat_id, "سلام 👋 ربات فعاله. برای تست، هر متنی بفرست تا برگردونم.")
+            await send_message(chat_id, "سلام! به ربات خوش آمدید.")
         else:
-            await send_message(chat_id, text)
+            await send_message(chat_id, f"شما گفتید: {text}")
