@@ -1,4 +1,3 @@
-# src/db.py
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -6,14 +5,11 @@ from psycopg2.extras import RealDictCursor
 DATABASE_URL = os.environ["DATABASE_URL"]
 
 def get_conn():
-    # Render/Neon معمولاً SSL می‌خواهد
     return psycopg2.connect(DATABASE_URL, sslmode="require")
 
 def init_db():
-    """ساخت/اصلاح اسکیمای لازم بدون اینکه سرویس از لایو خارج شود."""
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # جدول کاربران: اگر نبود بساز
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     tg_id BIGINT PRIMARY KEY,
@@ -21,11 +17,9 @@ def init_db():
                     is_admin BOOLEAN NOT NULL DEFAULT FALSE
                 );
             """)
-            # اگر قبلاً users ساخته شده ولی ستون‌های ما را ندارد، اضافه کن
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS tg_id BIGINT;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallet_cents INT NOT NULL DEFAULT 0;")
             cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE;")
-            # اگر Primary Key روی tg_id نیست، حداقل یکتا باشد
             cur.execute("""
                 DO $$
                 BEGIN
@@ -38,7 +32,6 @@ def init_db():
                 END $$;
             """)
 
-            # جدول محصولات
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS products (
                     id SERIAL PRIMARY KEY,
@@ -58,7 +51,6 @@ def get_or_create_user(tg_id: int):
             )
             row = cur.fetchone()
             if row is None:
-                # اگر کاربر نبود، بساز
                 cur.execute(
                     "INSERT INTO users (tg_id) VALUES (%s) ON CONFLICT (tg_id) DO NOTHING;",
                     (tg_id,),
@@ -68,7 +60,7 @@ def get_or_create_user(tg_id: int):
                     (tg_id,),
                 )
                 row = cur.fetchone()
-            return row  # dict با کلیدهای tg_id, wallet_cents, is_admin
+            return row
 
 def get_wallet(tg_id: int) -> int:
     with get_conn() as conn:
@@ -97,3 +89,18 @@ def add_product(title: str, price_cents: int, caption: str | None, photo_file_id
                 """,
                 (title, price_cents, caption, photo_file_id),
             )
+
+# تابعی که هندلر انتظار دارد
+def set_admins(admin_ids: list[int]):
+    """کاربرانی که در لیست هستند را ادمین می‌کند، بقیه را غیر ادمین."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            # همه را غیر ادمین کن
+            cur.execute("UPDATE users SET is_admin=FALSE;")
+            # این‌ها را ادمین کن
+            for tg_id in admin_ids:
+                cur.execute("""
+                    INSERT INTO users (tg_id, is_admin)
+                    VALUES (%s, TRUE)
+                    ON CONFLICT (tg_id) DO UPDATE SET is_admin=TRUE;
+                """, (tg_id,))
