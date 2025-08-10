@@ -1,86 +1,135 @@
-from .base import send_message, send_photo, ADMIN_IDS, CASHBACK_PERCENT
-from .db import (
-    init_db, set_admins, get_or_create_user, get_wallet,
-    list_products, add_product
-)
+# src/handlers.py
+import os
+import requests
+from db import init_db, set_admins, get_or_create_user, get_wallet, list_products, add_product
 
-WELCOME = (
-    "سلام! به ربات خوش آمدید.\n"
-    "دستورات: /products , /wallet/\n"
-    "اگر ادمین هستید، برای افزودن یک محصول با عکس، "
-    "عکسِ محصول را با کپشن به فرمِ «نام محصول | قیمت به تومان» بفرستید."
-)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.strip().isdigit()]
 
-def _ensure_user(update):
-    msg = update.get("message") or update.get("edited_message") or {}
-    frm = msg.get("from", {})
-    tg_id = int(frm.get("id", 0))
-    if tg_id:
-        get_or_create_user(tg_id)
-    return tg_id
-
-async def handle_update(update: dict):
+# در استارتاپ از bot.py صدا زده می‌شود
+def startup_warmup():
     try:
-        tg_id = _ensure_user(update)
-        # ادمین‌ها را یک‌بار همگام کن (بی‌ضرر است)
+        init_db()
         set_admins(ADMIN_IDS)
-
-        msg = update.get("message") or update.get("edited_message")
-        if not msg:
-            return
-
-        chat_id = int(msg["chat"]["id"])
-        text = (msg.get("text") or "").strip()
-
-        # فرمان‌ها
-        if text.startswith("/start"):
-            send_message(chat_id, WELCOME)
-            return
-
-        if text.startswith("/wallet"):
-            balance = get_wallet(tg_id)
-            send_message(chat_id, f"موجودی کیف پول شما: {balance//100:,} تومان")
-            return
-
-        if text.startswith("/products"):
-            items = list_products()
-            if not items:
-                send_message(chat_id, "هنوز محصولی ثبت نشده است.")
-                return
-            out = ["لیست محصولات:"]
-            for p in items:
-                out.append(f"• {p['name']} - {p['price_cents']//100:,} تومان")
-            send_message(chat_id, "\n".join(out))
-            return
-
-        # افزودن محصول توسط ادمین با ارسال عکس + کپشن "نام | قیمت"
-        if msg.get("photo") and tg_id in ADMIN_IDS:
-            caption = (msg.get("caption") or "").strip()
-            if "|" not in caption:
-                send_message(chat_id, "فرمت کپشن صحیح نیست. مثال: «کراپ ویژه | ۱۲۰۰۰۰»")
-                return
-            name, price_txt = [x.strip() for x in caption.split("|", 1)]
-            # تبدیل تومان به سنت (ریال/۱۰۰) برای سادگی: هر ۱ تومان = ۱۰۰ سنت
-            # (اگر فقط تومان می‌خواهی ذخیره کنی، می‌توانی *100 را حذف کنی)
-            price_num = 0
-            try:
-                price_num = int(price_txt.replace(",", "").replace("تومان", "").replace(" ", ""))
-            except Exception:
-                send_message(chat_id, "قیمت عددی نیست.")
-                return
-            price_cents = price_num * 100
-
-            photo_sizes = msg.get("photo") or []
-            file_id = photo_sizes[-1]["file_id"] if photo_sizes else None
-            add_product(name, price_cents, file_id)
-            send_message(chat_id, "محصول با موفقیت افزوده شد ✅")
-            if file_id:
-                send_photo(chat_id, file_id, f"{name} - {price_num:,} تومان")
-            return
-
-        # ناشناخته
-        if text:
-            send_message(chat_id, "دستور ناشناخته است. /start را بزنید.")
+        print("DB ready; admins set.")
     except Exception as e:
-        # هر اروری رخ دهد، سرویس لایو می‌ماند و فقط لاگ می‌گیریم
+        print("startup_warmup error:", e)
+
+def _send(chat_id, text, parse_mode=None):
+    try:
+        requests.post(f"{API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": parse_mode or "HTML",
+            "disable_web_page_preview": True
+        }, timeout=10)
+    except Exception as e:
+        print("sendMessage error:", e)
+
+def _extract_user(update: dict):
+    """
+    برمی‌گرداند: (chat_id, user_id, username, full_name, text, photo, caption)
+    در تمام انواع آپدیت‌های رایج.
+    """
+    chat_id = user_id = None
+    username = full_name = text = caption = None
+    photo = None
+
+    if "message" in update:
+        msg = update["message"]
+        chat_id = msg["chat"]["id"]
+        if "from" in msg:
+            f = msg["from"]
+            user_id = f.get("id")
+            username = f.get("username")
+            full_name = " ".join([f.get("first_name", "") or "", f.get("last_name", "") or ""]).strip() or None
+        text = msg.get("text")
+        caption = msg.get("caption")
+        # اگر عکس دارد
+        if "photo" in msg and msg["photo"]:
+            # بزرگترین سایز آخر آرایه است
+            photo = msg["photo"][-1].get("file_id")
+
+    elif "callback_query" in update:
+        cq = update["callback_query"]
+        msg = cq.get("message", {})
+        chat_id = (msg.get("chat") or {}).get("id")
+        f = cq.get("from", {})
+        user_id = f.get("id")
+        username = f.get("username")
+        full_name = " ".join([f.get("first_name", "") or "", f.get("last_name", "") or ""]).strip() or None
+        text = cq.get("data")
+
+    return chat_id, user_id, username, full_name, text, photo, caption
+
+def handle_update(update: dict):
+    """
+    ورودی خام وبهوک (JSON) را می‌گیرد.
+    هیچ خطایی به بیرون پروپاگیت نمی‌شود تا سرویس لایو بماند.
+    """
+    try:
+        chat_id, user_id, username, full_name, text, photo, caption = _extract_user(update)
+
+        if not chat_id:
+            return  # چیزی برای جواب‌دادن نداریم
+
+        # *** فیکس اصلی: قبل از هر کاری کاربر را بساز/به‌روز کن — و اگر user_id نداشتیم، کاری نکن ***
+        if user_id is not None:
+            try:
+                get_or_create_user(user_id, username=username, full_name=full_name)
+            except Exception as e:
+                print("get_or_create_user error:", e)
+        else:
+            print("No user_id in update; skip user upsert.")
+
+        # دستورات
+        if text == "/start":
+            _send(chat_id,
+                  "سلام! به ربات خوش آمدید.\n"
+                  "دستورات:\n"
+                  "<code>/products</code> ، <code>/wallet</code>\n"
+                  "اگر ادمین هستید، برای افزودن محصول یک عکس با کپشن بفرستید: <code>نام|قیمت_تومان|توضیح_اختیاری</code>")
+            return
+
+        if text == "/wallet":
+            bal_cents = get_wallet(user_id) if user_id is not None else 0
+            toman = bal_cents // 100
+            _send(chat_id, f"موجودی کیف پول شما: {toman} تومان")
+            return
+
+        if text == "/products":
+            prods = list_products()
+            if not prods:
+                _send(chat_id, "هنوز محصولی ثبت نشده است.")
+            else:
+                lines = []
+                for p in prods:
+                    toman = int(p["price_cents"]) // 100
+                    lines.append(f"• {p['name']} — {toman} تومان")
+                _send(chat_id, "\n".join(lines))
+            return
+
+        # افزودن محصول توسط ادمین: ارسال Photo + Caption
+        if photo and caption and (str(user_id) in {str(a) for a in ADMIN_IDS}):
+            try:
+                parts = [x.strip() for x in caption.split("|")]
+                if len(parts) >= 2:
+                    name = parts[0]
+                    price_toman = int(parts[1].replace(",", ""))
+                    desc = parts[2] if len(parts) >= 3 else None
+                    add_product(name=name,
+                                price_cents=price_toman * 100,
+                                description=desc,
+                                photo_file_id=photo)
+                    _send(chat_id, "✅ محصول ثبت شد.")
+                else:
+                    _send(chat_id, "فرمت کپشن درست نیست. نمونه: <code>نام|قیمت_تومان|توضیح</code>")
+            except Exception as e:
+                print("add_product error:", e)
+                _send(chat_id, "❌ ثبت محصول ناموفق بود.")
+            return
+
+    except Exception as e:
+        # لاگ بدون ازکارانداختن وب‌سرور
         print("handle_update error:", e)
