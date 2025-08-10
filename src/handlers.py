@@ -1,135 +1,139 @@
-# src/handlers.py
 import os
-import requests
-from db import init_db, set_admins, get_or_create_user, get_wallet, list_products, add_product
+from typing import Optional
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.strip().isdigit()]
+# ایمپورت نسبی از لایه دیتابیس
+from .db import (
+    init_db,
+    set_admins,
+    get_or_create_user,
+    get_wallet,
+    list_products,
+    add_product,
+)
 
-# در استارتاپ از bot.py صدا زده می‌شود
+
 def startup_warmup():
-    try:
-        init_db()
-        set_admins(ADMIN_IDS)
-        print("DB ready; admins set.")
-    except Exception as e:
-        print("startup_warmup error:", e)
+    """در شروع برنامه، دیتابیس را آماده و ادمین‌ها را ست می‌کند."""
+    init_db()
+    set_admins()
 
-def _send(chat_id, text, parse_mode=None):
-    try:
-        requests.post(f"{API}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode or "HTML",
-            "disable_web_page_preview": True
-        }, timeout=10)
-    except Exception as e:
-        print("sendMessage error:", e)
 
-def _extract_user(update: dict):
+def _is_admin(tg_id: int) -> bool:
+    admins = os.getenv("ADMIN_IDS", "").strip()
+    if not admins:
+        return False
+    admin_ids = {int(x) for x in admins.replace(" ", "").split(",") if x}
+    return tg_id in admin_ids
+
+
+def _fmt_toman(cents: int) -> str:
+    # واحد داخلی ما 'سِنت' است (هر 100 = 1 تومان)
+    toman = cents // 100
+    return f"{toman:,} تومان".replace(",", "،")
+
+
+async def handle_update(update: dict):
     """
-    برمی‌گرداند: (chat_id, user_id, username, full_name, text, photo, caption)
-    در تمام انواع آپدیت‌های رایج.
+    فقط پیام‌های متنی ساده و عکس با کپشن را پوشش می‌دهیم.
+    /start , /products , /wallet
+    ادمین: ارسال عکس با کپشن = افزودن محصول
+      قالب کپشن:  عنوان | قیمت‌تومان | توضیحات (اختیاری)
     """
-    chat_id = user_id = None
-    username = full_name = text = caption = None
-    photo = None
+    try:
+        msg = update.get("message") or update.get("edited_message")
+        if not msg:
+            return
 
-    if "message" in update:
-        msg = update["message"]
         chat_id = msg["chat"]["id"]
-        if "from" in msg:
-            f = msg["from"]
-            user_id = f.get("id")
-            username = f.get("username")
-            full_name = " ".join([f.get("first_name", "") or "", f.get("last_name", "") or ""]).strip() or None
-        text = msg.get("text")
-        caption = msg.get("caption")
-        # اگر عکس دارد
-        if "photo" in msg and msg["photo"]:
-            # بزرگترین سایز آخر آرایه است
-            photo = msg["photo"][-1].get("file_id")
+        from_user = msg.get("from") or {}
+        tg_id = int(from_user.get("id", 0))
 
-    elif "callback_query" in update:
-        cq = update["callback_query"]
-        msg = cq.get("message", {})
-        chat_id = (msg.get("chat") or {}).get("id")
-        f = cq.get("from", {})
-        user_id = f.get("id")
-        username = f.get("username")
-        full_name = " ".join([f.get("first_name", "") or "", f.get("last_name", "") or ""]).strip() or None
-        text = cq.get("data")
+        # کاربر را اگر نبود بسازیم/بخوانیم
+        user = get_or_create_user(from_user)  # {'tg_id','wallet_cents','is_admin'}
 
-    return chat_id, user_id, username, full_name, text, photo, caption
+        text: Optional[str] = msg.get("text")
 
-def handle_update(update: dict):
-    """
-    ورودی خام وبهوک (JSON) را می‌گیرد.
-    هیچ خطایی به بیرون پروپاگیت نمی‌شود تا سرویس لایو بماند.
-    """
-    try:
-        chat_id, user_id, username, full_name, text, photo, caption = _extract_user(update)
+        # عکس با کپشن (فقط برای ادمین‌ها)
+        if "photo" in msg and _is_admin(tg_id):
+            caption = msg.get("caption") or ""
+            if caption:
+                # قالب: title | price_in_toman | desc(optional)
+                parts = [p.strip() for p in caption.split("|")]
+                if len(parts) >= 2:
+                    title = parts[0]
+                    try:
+                        price_toman = int(parts[1].replace("،", "").replace(",", ""))
+                    except ValueError:
+                        await _send_text(chat_id, "❌ قیمت نامعتبر است. مثال: «کِرِپ شکلات | 85000 | توضیح اختیاری»")
+                        return
+                    desc = parts[2] if len(parts) >= 3 else None
 
-        if not chat_id:
-            return  # چیزی برای جواب‌دادن نداریم
+                    # بزرگ‌ترین فایل‌اید عکس را بگیریم
+                    photo_sizes = msg["photo"]
+                    file_id = photo_sizes[-1]["file_id"]
 
-        # *** فیکس اصلی: قبل از هر کاری کاربر را بساز/به‌روز کن — و اگر user_id نداشتیم، کاری نکن ***
-        if user_id is not None:
-            try:
-                get_or_create_user(user_id, username=username, full_name=full_name)
-            except Exception as e:
-                print("get_or_create_user error:", e)
-        else:
-            print("No user_id in update; skip user upsert.")
+                    add_product(title=title, price_cents=price_toman * 100, caption=desc, photo_file_id=file_id)
+                    await _send_text(chat_id, f"✅ محصول «{title}» ذخیره شد.")
+                    return
+                else:
+                    await _send_text(chat_id, "❌ قالب کپشن: «عنوان | قیمت‌ تومانی | توضیح(اختیاری)»")
+                    return
 
-        # دستورات
-        if text == "/start":
-            _send(chat_id,
-                  "سلام! به ربات خوش آمدید.\n"
-                  "دستورات:\n"
-                  "<code>/products</code> ، <code>/wallet</code>\n"
-                  "اگر ادمین هستید، برای افزودن محصول یک عکس با کپشن بفرستید: <code>نام|قیمت_تومان|توضیح_اختیاری</code>")
-            return
+        # دستورات متنی
+        if text:
+            cmd = text.strip().lower()
+            if cmd == "/start":
+                await _send_text(
+                    chat_id,
+                    "سلام! به ربات خوش آمدید.\n"
+                    "دستورات: /products , /wallet\n"
+                    "اگر ادمین هستید، برای افزودن محصول یک عکس با کپشن بفرستید.",
+                )
+                return
 
-        if text == "/wallet":
-            bal_cents = get_wallet(user_id) if user_id is not None else 0
-            toman = bal_cents // 100
-            _send(chat_id, f"موجودی کیف پول شما: {toman} تومان")
-            return
+            if cmd == "/wallet":
+                balance = get_wallet(tg_id)
+                await _send_text(chat_id, f"موجودی کیف پول شما: {_fmt_toman(balance)}")
+                return
 
-        if text == "/products":
-            prods = list_products()
-            if not prods:
-                _send(chat_id, "هنوز محصولی ثبت نشده است.")
-            else:
+            if cmd == "/products":
+                prods = list_products()
+                if not prods:
+                    await _send_text(chat_id, "هنوز محصولی ثبت نشده است.")
+                    return
+
+                # ارسال فهرست ساده (برای سادگی فعلاً فقط متن)
                 lines = []
                 for p in prods:
-                    toman = int(p["price_cents"]) // 100
-                    lines.append(f"• {p['name']} — {toman} تومان")
-                _send(chat_id, "\n".join(lines))
-            return
-
-        # افزودن محصول توسط ادمین: ارسال Photo + Caption
-        if photo and caption and (str(user_id) in {str(a) for a in ADMIN_IDS}):
-            try:
-                parts = [x.strip() for x in caption.split("|")]
-                if len(parts) >= 2:
-                    name = parts[0]
-                    price_toman = int(parts[1].replace(",", ""))
-                    desc = parts[2] if len(parts) >= 3 else None
-                    add_product(name=name,
-                                price_cents=price_toman * 100,
-                                description=desc,
-                                photo_file_id=photo)
-                    _send(chat_id, "✅ محصول ثبت شد.")
-                else:
-                    _send(chat_id, "فرمت کپشن درست نیست. نمونه: <code>نام|قیمت_تومان|توضیح</code>")
-            except Exception as e:
-                print("add_product error:", e)
-                _send(chat_id, "❌ ثبت محصول ناموفق بود.")
-            return
+                    lines.append(f"• {p['title']} — {_fmt_toman(p['price_cents'])}")
+                    if p.get("caption"):
+                        lines.append(f"  {p['caption']}")
+                await _send_text(chat_id, "\n".join(lines))
+                return
 
     except Exception as e:
-        # لاگ بدون ازکارانداختن وب‌سرور
+        # لاگ خطا در رندر دیده می‌شود
         print("handle_update error:", e)
+
+
+# --- کمک‌متد ارسال پیام تلگرام (ساده و بدون کتابخانه) ---
+import http.client
+import json
+from urllib.parse import urlencode
+
+
+def _bot_token() -> str:
+    return os.environ["BOT_TOKEN"].strip()
+
+
+async def _send_text(chat_id: int, text: str):
+    try:
+        payload = {"chat_id": chat_id, "text": text}
+        body = urlencode(payload)
+        conn = http.client.HTTPSConnection("api.telegram.org", timeout=10)
+        conn.request("POST", f"/bot{_bot_token()}/sendMessage", body,
+                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+        conn.getresponse().read()  # پاسخی لازم نداریم
+        conn.close()
+    except Exception as e:
+        print("send_message error:", e)
