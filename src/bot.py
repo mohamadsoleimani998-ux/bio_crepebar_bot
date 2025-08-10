@@ -1,3 +1,4 @@
+import os
 from fastapi import FastAPI, Request
 from src.handlers import handle_update, startup_warmup
 from src.db import init_db
@@ -8,12 +9,10 @@ app = FastAPI()
 def _startup():
     try:
         init_db()
-        # تنظیم ادمین‌ها و غیره
-        import anyio
-        anyio.from_thread.run(startup_warmup)
-        print("DB init OK")
+        startup_warmup()
+        print("Startup OK")
     except Exception as e:
-        print("init_db error:", e)
+        print("Startup error:", e)
 
 @app.post("/webhook")
 async def webhook(request: Request):
