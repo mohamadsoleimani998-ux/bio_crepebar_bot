@@ -1,67 +1,88 @@
 import os
 import psycopg2
-from psycopg2.extras import RealDictCursor
 
-# ------------------ اتصال به دیتابیس ------------------
-def get_connection():
-    dsn = os.getenv("DATABASE_URL")
-    if "sslmode" not in dsn:
-        dsn = dsn + ("&" if "?" in dsn else "?") + "sslmode=require"
-    return psycopg2.connect(dsn, cursor_factory=RealDictCursor)
+DB_URL = os.getenv("DATABASE_URL")
 
-# ------------------ ایجاد یا آپدیت جداول ------------------
 def _get_conn():
-    dsn = os.getenv("DATABASE_URL")
-    if "sslmode" not in dsn:
-        dsn = dsn + ("&" if "?" in dsn else "?") + "sslmode=require"
-    return psycopg2.connect(dsn)
+    return psycopg2.connect(DB_URL)
 
-_SCHEMA_SQL = """
--- جدول کاربران
-CREATE TABLE IF NOT EXISTS users (
-  id           BIGSERIAL PRIMARY KEY,
-  tg_id        BIGINT UNIQUE NOT NULL,
-  wallet_cents INTEGER NOT NULL DEFAULT 0,
-  is_admin     BOOLEAN NOT NULL DEFAULT FALSE,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-);
+def init_db():
+    """ایجاد جداول در صورت نبودن (بدون دست‌زدن به داده‌های فعلی)"""
+    conn = _get_conn()
+    cur = conn.cursor()
 
-ALTER TABLE users
-  ADD COLUMN IF NOT EXISTS wallet_cents INTEGER NOT NULL DEFAULT 0,
-  ADD COLUMN IF NOT EXISTS is_admin     BOOLEAN NOT NULL DEFAULT FALSE;
+    # کاربران
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            tg_id BIGINT PRIMARY KEY,
+            wallet_cents BIGINT DEFAULT 0,
+            is_admin BOOLEAN DEFAULT FALSE
+        )
+    """)
 
--- جدول محصولات
-CREATE TABLE IF NOT EXISTS products (
-  id            BIGSERIAL PRIMARY KEY,
-  title         TEXT NOT NULL,
-  price_cents   INTEGER NOT NULL,
-  photo_file_id TEXT,
-  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
+    # محصولات
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            price_cents BIGINT NOT NULL,
+            photo_file_id TEXT
+        )
+    """)
 
-def ensure_schema():
-    try:
-        with _get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(_SCHEMA_SQL)
-        print("DB schema ensured.")
-    except Exception as e:
-        print("ensure_schema error:", repr(e))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-# ------------------ توابع کمکی ------------------
 def get_or_create_user(tg_id: int):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, wallet_cents, is_admin FROM users WHERE tg_id=%s", (tg_id,))
-            user = cur.fetchone()
-            if not user:
-                cur.execute("INSERT INTO users (tg_id) VALUES (%s) RETURNING id, wallet_cents, is_admin", (tg_id,))
-                user = cur.fetchone()
-        return user
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT tg_id, wallet_cents, is_admin FROM users WHERE tg_id=%s", (tg_id,))
+    row = cur.fetchone()
+    if not row:
+        cur.execute("INSERT INTO users (tg_id, wallet_cents, is_admin) VALUES (%s, %s, %s)", (tg_id, 0, False))
+        conn.commit()
+        row = (tg_id, 0, False)
+    cur.close()
+    conn.close()
+    return {"tg_id": row[0], "wallet_cents": row[1], "is_admin": row[2]}
 
-def get_products():
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, title, price_cents, photo_file_id FROM products ORDER BY id")
-            return cur.fetchall()
+def get_wallet(tg_id: int) -> int:
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT wallet_cents FROM users WHERE tg_id=%s", (tg_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return row[0] if row else 0
+
+def update_wallet(tg_id: int, delta_cents: int):
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET wallet_cents = COALESCE(wallet_cents,0) + %s WHERE tg_id=%s", (delta_cents, tg_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def list_products():
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, price_cents, photo_file_id FROM products ORDER BY id DESC")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [
+        {"id": r[0], "title": r[1], "price_cents": r[2], "photo_file_id": r[3]}
+        for r in rows
+    ]
+
+def add_product(title: str, price_cents: int, photo_file_id: str | None):
+    conn = _get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO products (title, price_cents, photo_file_id) VALUES (%s, %s, %s)",
+        (title, price_cents, photo_file_id),
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
