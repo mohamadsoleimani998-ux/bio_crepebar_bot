@@ -1,45 +1,49 @@
 import os
-import requests
-from typing import Iterable, Tuple
+import httpx
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+API_BASE = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
-def _safe(params: dict) -> dict:
-    return {k: v for k, v in params.items() if v is not None}
+# یک کلاینت کم‌مصرف برای درخواست‌ها
+_client = httpx.AsyncClient(timeout=15)
 
-def _log(msg: str):
-    print("[base]", msg)
+def _reply_kb(button_rows):
+    # ساختار reply_keyboard برای تلگرام
+    return {"keyboard": button_rows, "resize_keyboard": True, "one_time_keyboard": False}
 
-async def send_message(chat_id: int, text: str):
-    # اگر توکن نبود، فقط لاگ تا سرویس نخوابه
-    if not API:
-        _log(f"send_message skipped (no BOT_TOKEN). chat_id={chat_id}, text={text!r}")
-        return
-    try:
-        requests.post(f"{API}/sendMessage", json=_safe({
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        }), timeout=10)
-    except Exception as e:
-        _log(f"send_message error: {e}")
+def main_menu_kb(is_admin: bool):
+    rows = [
+        [{"text": "🍽 منو"}, {"text": "🛒 ثبت سفارش"}],
+        [{"text": "💼 کیف پول"}],
+    ]
+    if is_admin:
+        rows.append([{"text": "➕ افزودن محصول"}])
+    return _reply_kb(rows)
 
-async def send_menu(chat_id: int):
-    txt = (
-        "سلام! به ربات خوش آمدید.\n"
-        "دستورات: /wallet ، /products\n"
-        "اگر ادمین هستید، برای افزودن محصول بعداً گزینه ادمین اضافه می‌کنیم."
-    )
-    await send_message(chat_id, txt)
+def inline_products_kb(products):
+    # برای ثبت سفارش با دکمه‌های اینلاین
+    # هر دکمه دیتا به صورت "order:<id>" می‌فرستد
+    kb = []
+    row = []
+    for i, p in enumerate(products, start=1):
+        row.append({
+            "text": f"{p['title']} - {p['price_t']} تومان",
+            "callback_data": f"order:{p['id']}"
+        })
+        if i % 2 == 0:
+            kb.append(row); row = []
+    if row:
+        kb.append(row)
+    return {"inline_keyboard": kb}
 
-def set_my_commands(pairs: Iterable[Tuple[str, str]]):
-    if not API:
-        _log("set_my_commands skipped (no BOT_TOKEN).")
-        return
-    try:
-        commands = [{"command": c, "description": d} for c, d in pairs]
-        requests.post(f"{API}/setMyCommands", json={"commands": commands}, timeout=10)
-    except Exception as e:
-        _log(f"set_my_commands error: {e}")
+async def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    await _client.post(f"{API_BASE}/sendMessage", json=payload)
+
+async def answer_callback_query(cb_id: str, text: str = ""):
+    await _client.post(f"{API_BASE}/answerCallbackQuery", json={
+        "callback_query_id": cb_id,
+        "text": text
+    })
