@@ -1,107 +1,137 @@
 import os
+import logging
 import requests
+from typing import Any, Dict, Optional
 
-from db import init_db, get_or_create_user, get_wallet, list_products, add_product
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-
-ADMIN_IDS = set()
-_raw_admins = os.getenv("ADMIN_IDS", "")
-if _raw_admins:
-    for x in _raw_admins.replace(",", " ").split():
-        try:
-            ADMIN_IDS.add(int(x))
-        except Exception:
-            pass
-
-def _send_text(chat_id: int, text: str, reply_to: int | None = None):
+# ارسال پیام
+def send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
     try:
-        requests.post(f"{API}/sendMessage", json={
-            "chat_id": chat_id,
-            "text": text,
-            "reply_to_message_id": reply_to
-        }, timeout=8)
+        payload = {"chat_id": chat_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+        requests.post(f"{API_BASE}/sendMessage", json=payload, timeout=10)
     except Exception as e:
-        print("sendMessage err:", e)
+        logging.exception("send_message error: %s", e)
 
-def _send_photo(chat_id: int, file_id: str, caption: str = ""):
+# چک کردن ادمین بودن
+def is_admin(user_id: int) -> bool:
+    raw = os.getenv("ADMIN_IDS", "")
+    if not raw:
+        return False
     try:
-        requests.post(f"{API}/sendPhoto", json={
-            "chat_id": chat_id,
-            "photo": file_id,
-            "caption": caption
-        }, timeout=10)
-    except Exception as e:
-        print("sendPhoto err:", e)
+        return str(user_id) in [s.strip() for s in raw.split(",") if s.strip()]
+    except Exception:
+        return False
 
-async def handle_update(update: dict):
-    # ایمن: اگر DB آماده نبود، اینجا هم کرش نمی‌کنیم
+# ایمپورت امن دیتابیس
+def _db():
     try:
-        init_db()
+        from src import db  # type: ignore
+        return db
     except Exception as e:
-        print("init on update err:", e)
+        logging.warning("db module not ready: %s", e)
+        return None
 
-    msg = update.get("message") or update.get("edited_message")
-    if not msg:
-        return
-
-    chat_id = msg["chat"]["id"]
-    from_id = msg["from"]["id"]
-    text = (msg.get("text") or "").strip()
-
-    # همیشه کاربر را داشته باشیم
-    user = get_or_create_user(from_id)
-
-    if text == "/start":
-        _send_text(chat_id, "سلام! به ربات خوش آمدید.\nدستورات: /wallet , /products")
-        return
-
-    if text == "/wallet":
-        cents = get_wallet(from_id)
-        _send_text(chat_id, f"موجودی کیف پول: {cents/100:.2f} تومان")
-        return
-
-    if text == "/products":
-        prods = list_products()
-        if not prods:
-            _send_text(chat_id, "فعلاً محصولی ثبت نشده است.")
+# هندل آپدیت
+async def handle_update(update: Dict[str, Any]):
+    try:
+        message = update.get("message") or update.get("edited_message")
+        if not message:
             return
-        for p in prods[:10]:
-            cap = f"{p['name']} - قیمت: {p['price_cents']/100:.2f} تومان"
-            if p.get("photo_file_id"):
-                _send_photo(chat_id, p["photo_file_id"], cap)
+
+        chat_id = message["chat"]["id"]
+        text = (message.get("text") or "").strip()
+        user_id = message.get("from", {}).get("id")
+
+        # /start
+        if text.startswith("/start"):
+            send_message(
+                chat_id,
+                "سلام! به ربات خوش آمدید.\n"
+                "دستورات: /products ، /wallet\n"
+                "اگر ادمین هستید، برای افزودن محصول یک عکس با کپشن بفرستید."
+            )
+            return
+
+        # /products
+        if text.startswith("/products"):
+            db = _db()
+            if db and hasattr(db, "list_products"):
+                try:
+                    items = db.list_products()
+                    if not items:
+                        send_message(chat_id, "هنوز محصولی ثبت نشده است.")
+                        return
+
+                    lines = []
+                    for p in items:
+                        pid, title, price_cents, desc, _photo = p
+                        price = (price_cents or 0) / 100
+                        lines.append(f"#{pid} — {title} — {price:.0f} تومان\n{desc or ''}")
+                    send_message(chat_id, "\n\n".join(lines))
+                except Exception as e:
+                    logging.exception("list_products error: %s", e)
+                    send_message(chat_id, "خطا در دریافت لیست محصولات.")
             else:
-                _send_text(chat_id, cap)
-        return
-
-    # اضافه کردن محصول توسط ادمین (اسم و قیمت در کپشن عکس یا متن)
-    if text.startswith("/addproduct"):
-        if (from_id not in ADMIN_IDS) and (not user.get("is_admin")):
-            _send_text(chat_id, "اجازهٔ این کار را ندارید.")
-            return
-        # الگو: /addproduct نام محصول | 125000 (تومان)  -> تبدیل به سنت
-        try:
-            parts = text.split(" ", 1)[1]
-            name, price_tmn = [x.strip() for x in parts.split("|", 1)]
-            price_cents = int(float(price_tmn.replace(",", "")) * 100)
-        except Exception:
-            _send_text(chat_id, "فرمت درست: /addproduct نام | قیمت_تومان")
+                send_message(chat_id, "ماژول دیتابیس یا تابع محصولات آماده نیست.")
             return
 
-        # اگر پیام عکس دارد، فایل آیدی عکس را بردار
-        photo_file_id = None
-        photos = msg.get("photo") or []
-        if photos:
-            # بزرگ‌ترین سایز آخرین ایتم
-            photo_file_id = photos[-1].get("file_id")
+        # /wallet
+        if text.startswith("/wallet"):
+            db = _db()
+            try:
+                if db and hasattr(db, "get_wallet"):
+                    cents = db.get_wallet(user_id)
+                    tomans = (cents or 0) / 100
+                    send_message(chat_id, f"موجودی کیف پول شما: {tomans:.0f} تومان")
+                elif db and hasattr(db, "get_or_create_user"):
+                    u = db.get_or_create_user(user_id)
+                    wallet_cents = None
+                    if isinstance(u, dict):
+                        wallet_cents = u.get("wallet_cents")
+                    elif isinstance(u, (list, tuple)) and len(u) >= 2:
+                        wallet_cents = u[1]
+                    tomans = (wallet_cents or 0) / 100
+                    send_message(chat_id, f"موجودی کیف پول شما: {tomans:.0f} تومان")
+                else:
+                    send_message(chat_id, "کیف پول هنوز فعال نشده است.")
+            except Exception as e:
+                logging.exception("wallet error: %s", e)
+                send_message(chat_id, "خطا در دریافت کیف پول.")
+            return
 
-        new_id = add_product(name, price_cents, photo_file_id)
-        if new_id:
-            _send_text(chat_id, f"محصول ثبت شد (ID: {new_id}).")
-        else:
-            _send_text(chat_id, "خطا در ثبت محصول.")
-        return
+        # افزودن محصول با عکس
+        if "photo" in message and is_admin(user_id):
+            caption = (message.get("caption") or "").strip()
+            photos = message.get("photo") or []
+            if not photos:
+                return
+            file_id = photos[-1]["file_id"]
 
-    # سایر متن‌ها
-    _send_text(chat_id, "دستور ناشناخته. /wallet یا /products را ارسال کنید.")
+            try:
+                title, price_toman, *rest = [s.strip() for s in caption.split("|")]
+                description = rest[0] if rest else ""
+                price_cents = int(float(price_toman)) * 100
+            except Exception:
+                send_message(chat_id, "فرمت کپشن صحیح نیست. مثال:\nعنوان | قیمت_به_تومان | توضیح")
+                return
+
+            db = _db()
+            if db and hasattr(db, "add_product"):
+                try:
+                    db.add_product(title, price_cents, description, file_id)
+                    send_message(chat_id, "محصول با موفقیت اضافه شد ✅")
+                except Exception as e:
+                    logging.exception("add_product error: %s", e)
+                    send_message(chat_id, "خطا در افزودن محصول.")
+            else:
+                send_message(chat_id, "تابع افزودن محصول آماده نیست.")
+            return
+
+        send_message(chat_id, "دستور ناشناخته. از /start استفاده کنید.")
+
+    except Exception as e:
+        logging.exception("handle_update error: %s", e)
