@@ -1,224 +1,129 @@
-# src/db.py
-from __future__ import annotations
-
-import os
 import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg2.extras
+from contextlib import contextmanager
+from datetime import datetime
+from .base import DATABASE_URL
 
-# -------------------------------
-# تنظیمات
-# -------------------------------
-DATABASE_URL = os.getenv("DATABASE_URL")  # مثل: postgresql://.../neondb?sslmode=require
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL محیطی تنظیم نشده است.")
-
-def get_cashback_percent() -> int:
-    """درصد کش‌بک از ENV. اگر تنظیم نبود، 0."""
+@contextmanager
+def get_conn():
+    conn = psycopg2.connect(DATABASE_URL)
     try:
-        return int(os.getenv("CASHBACK_PERCENT", "0").strip())
-    except Exception:
-        return 0
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
-# -------------------------------
-# اتصال پایگاه‌داده (singleton)
-# -------------------------------
-_conn = None
-
-def _get_conn():
-    global _conn
-    if _conn is None or _conn.closed:
-        _conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        _conn.autocommit = True
-    return _conn
-
-# ابزار ساده اجرا
-def _fetchall(sql: str, params: tuple = ()):
-    with _get_conn().cursor() as cur:
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-        return [dict(r) for r in rows]
-
-def _fetchone(sql: str, params: tuple = ()):
-    with _get_conn().cursor() as cur:
-        cur.execute(sql, params)
-        row = cur.fetchone()
-        return dict(row) if row else None
-
-def _execute(sql: str, params: tuple = ()):
-    with _get_conn().cursor() as cur:
-        cur.execute(sql, params)
-
-# -------------------------------
-# ساخت اسکیمای اولیه
-# -------------------------------
-def ensure_schema() -> None:
-    """
-    جداول لازم را اگر وجود ندارند ایجاد می‌کند.
-    """
-    _execute(
-        """
+def init_db():
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            telegram_id BIGINT PRIMARY KEY,
+            name TEXT,
+            phone TEXT,
+            address TEXT,
+            wallet_balance INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS products (
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
-            price BIGINT NOT NULL,    -- تومان
-            photo_url TEXT DEFAULT ''
+            price INTEGER NOT NULL,
+            photo_url TEXT
         );
-        """
-    )
-
-    _execute(
-        """
-        CREATE TABLE IF NOT EXISTS customers (
-            id SERIAL PRIMARY KEY,
-            tg_user_id BIGINT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            phone TEXT NOT NULL,
-            address TEXT NOT NULL,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-        """
-    )
-
-    _execute(
-        """
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id SERIAL PRIMARY KEY,
-            customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
-            product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
-            qty INTEGER NOT NULL,
-            total_amount BIGINT NOT NULL,   -- تومان
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+            items JSONB NOT NULL,
+            total_amount INTEGER NOT NULL,
+            cashback_amount INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            note TEXT
         );
-        """
-    )
-
-    _execute(
-        """
-        CREATE TABLE IF NOT EXISTS wallets (
-            user_id BIGINT PRIMARY KEY,
-            balance BIGINT NOT NULL DEFAULT 0
-        );
-        """
-    )
-
-    _execute(
-        """
-        CREATE TABLE IF NOT EXISTS wallet_transactions (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            delta BIGINT NOT NULL,          -- + یا - به تومان
-            reason TEXT DEFAULT '',
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
-        );
-        """
-    )
-
-    _execute(
-        """
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS topups (
             id SERIAL PRIMARY KEY,
-            user_id BIGINT NOT NULL,
-            amount BIGINT NOT NULL,
-            method TEXT NOT NULL,           -- card2card / gateway / ...
-            reference TEXT DEFAULT '',
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+            method TEXT NOT NULL,            -- 'card_to_card' یا 'gateway'
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending', -- pending, approved, rejected
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
-        """
-    )
+        """)
 
-# -------------------------------
-# محصولات
-# -------------------------------
-def list_products():
-    return _fetchall(
-        "SELECT id, name, price, COALESCE(photo_url, '') AS photo_url FROM products ORDER BY id ASC;"
-    )
-
-def get_product(product_id: int):
-    return _fetchone(
-        "SELECT id, name, price, COALESCE(photo_url,'') AS photo_url FROM products WHERE id=%s;",
-        (product_id,),
-    )
-
-def add_product(name: str, price: int, photo_url: str = "") -> int:
-    row = _fetchone(
-        "INSERT INTO products (name, price, photo_url) VALUES (%s, %s, %s) RETURNING id;",
-        (name, int(price), photo_url or ""),
-    )
-    return int(row["id"])
-
-def update_product(product_id: int, field: str, value):
-    allowed = {"name", "price", "photo_url"}
-    if field not in allowed:
-        raise ValueError("فیلد نامعتبر برای ویرایش.")
-    if field == "price":
-        value = int(value)
-    _execute(f"UPDATE products SET {field}=%s WHERE id=%s;", (value, product_id))
-
-# -------------------------------
-# مشتری و سفارش
-# -------------------------------
-def upsert_customer(user_id: int, name: str, phone: str, address: str) -> int:
-    """
-    اگر مشتری با tg_user_id وجود داشت آپدیت می‌شود؛ در غیر این صورت ساخته می‌شود.
-    """
-    existing = _fetchone("SELECT id FROM customers WHERE tg_user_id=%s;", (user_id,))
-    if existing:
-        _execute(
-            "UPDATE customers SET name=%s, phone=%s, address=%s, updated_at=NOW() WHERE id=%s;",
-            (name, phone, address, existing["id"]),
-        )
-        return int(existing["id"])
-    row = _fetchone(
-        "INSERT INTO customers (tg_user_id, name, phone, address) VALUES (%s,%s,%s,%s) RETURNING id;",
-        (user_id, name, phone, address),
-    )
-    return int(row["id"])
-
-def create_order(customer_id: int, product_id: int, qty: int, total_amount: int) -> int:
-    row = _fetchone(
-        """
-        INSERT INTO orders (customer_id, product_id, qty, total_amount)
-        VALUES (%s, %s, %s, %s)
-        RETURNING id;
-        """,
-        (customer_id, product_id, int(qty), int(total_amount)),
-    )
-    return int(row["id"])
-
-# -------------------------------
-# کیف پول و تراکنش‌ها
-# -------------------------------
-def get_wallet(user_id: int):
-    row = _fetchone("SELECT user_id, balance FROM wallets WHERE user_id=%s;", (user_id,))
-    if not row:
-        return {"user_id": user_id, "balance": 0}
-    return {"user_id": int(row["user_id"]), "balance": int(row["balance"])}
-
-def change_wallet_balance(user_id: int, delta: int, reason: str = "") -> None:
-    # به‌روزرسانی یا درج اولیه
-    _execute(
-        """
-        INSERT INTO wallets (user_id, balance)
+def upsert_user(tg_id: int, name: str | None = None):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO users (telegram_id, name)
         VALUES (%s, %s)
-        ON CONFLICT (user_id) DO UPDATE SET balance = wallets.balance + EXCLUDED.balance;
-        """,
-        (user_id, int(delta)),
-    )
-    # لاگ تراکنش
-    _execute(
-        "INSERT INTO wallet_transactions (user_id, delta, reason) VALUES (%s, %s, %s);",
-        (user_id, int(delta), reason or ""),
-    )
+        ON CONFLICT (telegram_id) DO UPDATE SET name = COALESCE(EXCLUDED.name, users.name);
+        """, (tg_id, name))
 
-def record_topup(user_id: int, amount: int, method: str, reference: str = "") -> int:
-    row = _fetchone(
-        """
-        INSERT INTO topups (user_id, amount, method, reference)
-        VALUES (%s, %s, %s, %s)
+def set_user_info(tg_id: int, name: str | None, phone: str | None, address: str | None):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        UPDATE users SET
+            name = COALESCE(%s, name),
+            phone = COALESCE(%s, phone),
+            address = COALESCE(%s, address)
+        WHERE telegram_id = %s;
+        """, (name, phone, address, tg_id))
+
+def get_user(tg_id: int):
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT * FROM users WHERE telegram_id=%s;", (tg_id,))
+        return cur.fetchone()
+
+def list_products():
+    with get_conn() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, name, price, photo_url FROM products ORDER BY id;")
+        return cur.fetchall()
+
+def add_product(name: str, price: int, photo_url: str | None):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("INSERT INTO products (name, price, photo_url) VALUES (%s,%s,%s);",
+                    (name, price, photo_url))
+
+def update_product(prod_id: int, name: str | None, price: int | None, photo_url: str | None):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        UPDATE products
+        SET name = COALESCE(%s, name),
+            price = COALESCE(%s, price),
+            photo_url = COALESCE(%s, photo_url)
+        WHERE id=%s;
+        """, (name, price, photo_url, prod_id))
+
+def delete_product(prod_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM products WHERE id=%s;", (prod_id,))
+
+def change_wallet(tg_id: int, delta: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        UPDATE users SET wallet_balance = wallet_balance + %s WHERE telegram_id=%s
+        RETURNING wallet_balance;
+        """, (delta, tg_id))
+        row = cur.fetchone()
+        return row[0] if row else None
+
+def create_order(tg_id: int, items: list[dict], total: int, cashback: int, note: str | None):
+    import json
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO orders (user_id, items, total_amount, cashback_amount, note)
+        VALUES (%s, %s, %s, %s, %s)
         RETURNING id;
-        """,
-        (user_id, int(amount), method, reference or ""),
-    )
-    return int(row["id"])
+        """, (tg_id, json.dumps(items), total, cashback, note))
+        return cur.fetchone()[0]
+
+def create_topup(tg_id: int, amount: int, method: str):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("""
+        INSERT INTO topups (user_id, amount, method) VALUES (%s,%s,%s) RETURNING id;
+        """, (tg_id, amount, method))
+        return cur.fetchone()[0]
