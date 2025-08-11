@@ -1,49 +1,57 @@
-import os
-import json
 import asyncio
-from fastapi import FastAPI, Request, Response
+import os
+from telegram import BotCommand
+from telegram.ext import ApplicationBuilder
+from .handlers import build_handlers
+from .base import BOT_TOKEN, PUBLIC_URL, ADMIN_IDS
+from . import db
 
-from telegram import Update
-from telegram.ext import Application
+PORT = int(os.environ.get("PORT", "8000"))
 
-# اطمینان از مقداردهی env
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env is missing")
+async def on_start(app):
+    # DB
+    db.init_db()
+    # ذخیره ادمین‌ها در bot_data
+    app.bot_data["ADMINS"] = ADMIN_IDS or []
+    # ست کردن منو/دستورات
+    await app.bot.set_my_commands([
+        BotCommand("products", "نمایش منو"),
+        BotCommand("wallet", "کیف پول"),
+        BotCommand("order", "ثبت سفارش"),
+        BotCommand("topup", "شارژ کیف پول"),
+        BotCommand("contact", "ارتباط با ما"),
+        BotCommand("help", "راهنما"),
+        BotCommand("game", "بازی"),
+        BotCommand("addproduct", "افزودن محصول (ادمین)"),
+    ])
 
-# ساخت اپ تلگرام
-application = Application.builder().token(BOT_TOKEN).build()
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing")
 
-# هندلرها
-from src.handlers import setup as setup_handlers
-setup_handlers(application)
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    # handlers
+    for h in build_handlers():
+        application.add_handler(h)
 
-# FastAPI
-app = FastAPI()
+    application.post_init = on_start
 
-@app.on_event("startup")
-async def on_startup():
-    # ست کردن وبهوک روی Render public URL
-    if PUBLIC_URL:
-        await application.bot.set_webhook(url=f"{PUBLIC_URL.rstrip('/')}/webhook")
-    # اجرای worker تلگرام
-    asyncio.create_task(application.initialize())
-    asyncio.create_task(application.start())
+    # Webhook server via PTB (aiohttp)
+    public_url = PUBLIC_URL.rstrip("/")
+    path = "/webhook"
+    webhook_url = f"{public_url}{path}" if public_url else None
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    await application.stop()
-    await application.shutdown()
+    if webhook_url:
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            secret_token=None,
+            webhook_url=webhook_url,
+            path=path,
+        )
+    else:
+        # fallback polling (برای اجرای لوکال)
+        application.run_polling()
 
-@app.post("/webhook")
-async def webhook(req: Request):
-    data = await req.json()
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return Response(status_code=200)
-
-# برای تست سلامت
-@app.get("/")
-async def root():
-    return {"ok": True}
+if __name__ == "__main__":
+    main()
