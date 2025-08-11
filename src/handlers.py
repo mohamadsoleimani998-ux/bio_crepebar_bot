@@ -25,10 +25,6 @@ MAIN_KB = ReplyKeyboardMarkup(
 def is_admin(user_id: int) -> bool:
     return user_id in SETTINGS.ADMIN_IDS
 
-async def startup_warmup(app: Application):
-    # اطمینان از ساخت جدول‌ها
-    db.init_db()
-
 # ===== /start /help ===========================================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
@@ -125,7 +121,6 @@ async def o_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def o_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["o_address"] = update.message.text.strip()
-    # نمایش محصولات برای انتخاب
     prods = db.list_products(active_only=True)
     if not prods:
         await update.message.reply_text("هنوز محصولی نداریم. بعداً امتحان کنید.", reply_markup=MAIN_KB)
@@ -140,7 +135,6 @@ async def o_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return O_ITEMS
 
 def _parse_items(text: str) -> list[tuple[int, int]]:
-    # "12x2, 5x1" -> [(12,2),(5,1)]
     res = []
     for chunk in text.replace(" ", "").split(","):
         if not chunk:
@@ -164,7 +158,6 @@ async def o_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await update.message.reply_text(f"شناسه {pid} یافت نشد.")
         p = pmap[pid]
         items.append({"product_id": pid, "title": p["title"], "qty": qty, "unit_price": p["price"]})
-    # ذخیره کاربر و ثبت سفارش
     uid = update.effective_user.id
     name = context.user_data["o_name"]
     phone = context.user_data["o_phone"]
@@ -172,7 +165,6 @@ async def o_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.update_profile(uid, phone, address, name)
     order_id = db.create_order(uid, name, phone, address, items, SETTINGS.CASHBACK_PERCENT)
     order = db.get_order(order_id)
-    # پیام تأیید برای کاربر
     lines = [f"سفارش #{order_id} ثبت شد ✅", "آیتم‌ها:"]
     for it in order["items"]:
         lines.append(f"- {it['title']} ×{it['qty']} — {it['unit_price']} ت")
@@ -181,7 +173,6 @@ async def o_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"کش‌بک: {order['cashback']} ت ✅ (به کیف پولتان اضافه شد)")
     lines.append(f"مبلغ پرداختی: {order['total']} ت")
     await update.message.reply_text("\n".join(lines), reply_markup=MAIN_KB)
-    # اطلاع به ادمین
     for admin_id in SETTINGS.ADMIN_IDS:
         try:
             await context.bot.send_message(
@@ -208,7 +199,6 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ادمین پس از بررسی شارژ می‌کند. (به‌زودی درگاه پرداخت اضافه می‌شود.)"
         )
 
-# ادمین: شارژ دستی کیف پول:  /charge <user_id> <amount>
 async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return await update.message.reply_text("دسترسی ندارید.")
@@ -218,7 +208,7 @@ async def cmd_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.add_wallet_tx(user_id, amount, "manual", {"by": update.effective_user.id})
     await update.message.reply_text("انجام شد ✅")
 
-# ===== Contact (conversation) ===============================================
+# ===== Contact ===============================================================
 C_MSG = 1
 
 async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -242,6 +232,9 @@ async def cmd_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== Registrar =============================================================
 def register(application: Application):
+    # به‌جای JobQueue، همین‌جا DB را initialize می‌کنیم تا خطای None برطرف شود.
+    db.init_db()
+
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("help", cmd_help))
     application.add_handler(CommandHandler("products", cmd_products))
@@ -249,7 +242,6 @@ def register(application: Application):
     application.add_handler(CommandHandler("game", cmd_game))
     application.add_handler(CommandHandler("charge", cmd_charge))
 
-    # add product (admin)
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("addproduct", cmd_add_product)],
         states={
@@ -263,7 +255,6 @@ def register(application: Application):
         fallbacks=[CommandHandler("cancel", ap_skip)],
     ))
 
-    # order
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("order", cmd_order)],
         states={
@@ -275,12 +266,8 @@ def register(application: Application):
         fallbacks=[CommandHandler("cancel", cmd_start)],
     ))
 
-    # contact
     application.add_handler(ConversationHandler(
         entry_points=[CommandHandler("contact", cmd_contact)],
         states={C_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_msg)]},
         fallbacks=[CommandHandler("cancel", cmd_start)],
     ))
-
-    # warmup
-    application.job_queue.run_once(lambda *_: application.create_task(startup_warmup(application)), when=0)
