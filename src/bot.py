@@ -1,25 +1,17 @@
-import os
-from fastapi import FastAPI, Request
 from src.handlers import handle_update, startup_warmup
-from src.db import init_db
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
+import os
 
-app = FastAPI()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-@app.on_event("startup")
-def _startup():
-    try:
-        init_db()
-        startup_warmup()
-        print("Startup OK")
-    except Exception as e:
-        print("Startup error:", e)
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    update = await request.json()
-    await handle_update(update)
-    return {"ok": True}
+    app.add_handler(MessageHandler(filters.ALL, handle_update))
+    app.post_init = startup_warmup
 
-@app.get("/")
-async def root():
-    return {"status": "bot is running"}
+    port = int(os.getenv("PORT", 5000))
+    app.run_polling(port=port)
+
+if __name__ == "__main__":
+    main()
