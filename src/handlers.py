@@ -10,7 +10,7 @@ from telegram.ext import (
     CallbackQueryHandler, ConversationHandler, filters
 )
 
-import db
+from . import db
 
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS","").replace(" ","").split(",") if x}
 CASHBACK_PERCENT = int(os.environ.get("CASHBACK_PERCENT", "0"))
