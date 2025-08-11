@@ -1,17 +1,22 @@
-from src.handlers import handle_update, startup_warmup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
-import os
+# bot.py
+from telegram.ext import Updater, CommandHandler
+import handlers
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+import os
+TOKEN = os.getenv("BOT_TOKEN")  # توکن ربات از env
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    updater = Updater(TOKEN, use_context=True)
+    dp = updater.dispatcher
 
-    app.add_handler(MessageHandler(filters.ALL, handle_update))
-    app.post_init = startup_warmup
+    dp.add_handler(CommandHandler("start", handlers.start))
+    dp.add_handler(CommandHandler("products", handlers.products))
+    dp.add_handler(CommandHandler("wallet", handlers.wallet))
+    dp.add_handler(CommandHandler("order", handlers.order))
+    dp.add_handler(CommandHandler("help", handlers.help_command))
 
-    port = int(os.getenv("PORT", 5000))
-    app.run_polling(port=port)
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
