@@ -1,57 +1,28 @@
-import asyncio
 import os
-from telegram import BotCommand
-from telegram.ext import ApplicationBuilder
-from .handlers import build_handlers
-from .base import BOT_TOKEN, PUBLIC_URL, ADMIN_IDS
-from . import db
-
-PORT = int(os.environ.get("PORT", "8000"))
-
-async def on_start(app):
-    # DB
-    db.init_db()
-    # ذخیره ادمین‌ها در bot_data
-    app.bot_data["ADMINS"] = ADMIN_IDS or []
-    # ست کردن منو/دستورات
-    await app.bot.set_my_commands([
-        BotCommand("products", "نمایش منو"),
-        BotCommand("wallet", "کیف پول"),
-        BotCommand("order", "ثبت سفارش"),
-        BotCommand("topup", "شارژ کیف پول"),
-        BotCommand("contact", "ارتباط با ما"),
-        BotCommand("help", "راهنما"),
-        BotCommand("game", "بازی"),
-        BotCommand("addproduct", "افزودن محصول (ادمین)"),
-    ])
+from telegram.ext import Application, ApplicationBuilder
+from .base import BOT_TOKEN, PUBLIC_URL, PORT, ADMIN_IDS
+from .handlers import register
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
+    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    # handlers
-    for h in build_handlers():
-        application.add_handler(h)
+    # ذخیره‌ی ادمین‌ها برای استفاده در هندلرها
+    application.bot_data["admin_ids"] = list(ADMIN_IDS)
 
-    application.post_init = on_start
+    # ثبت هندلرها
+    register(application)
 
-    # Webhook server via PTB (aiohttp)
-    public_url = PUBLIC_URL.rstrip("/")
-    path = "/webhook"
-    webhook_url = f"{public_url}{path}" if public_url else None
-
-    if webhook_url:
+    if PUBLIC_URL:
+        # Webhook برای Render
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            secret_token=None,
-            webhook_url=webhook_url,
-            path=path,
+            webhook_url=f"{PUBLIC_URL}/webhook",
+            drop_pending_updates=True,
         )
     else:
-        # fallback polling (برای اجرای لوکال)
-        application.run_polling()
+        # برای توسعه‌ی محلی
+        application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
