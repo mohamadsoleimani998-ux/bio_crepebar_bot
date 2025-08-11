@@ -1,180 +1,134 @@
-# src/db.py
 import os
 import psycopg2
-from contextlib import contextmanager
+from psycopg2.extras import Json
 
+# از متغیر محیطی Render/Neon
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-@contextmanager
+# ------------ اتصال -------------
 def get_conn():
-    conn = psycopg2.connect(DATABASE_URL)
-    try:
-        yield conn
-    finally:
-        conn.close()
+    return psycopg2.connect(DATABASE_URL)
 
+# ------------ ساخت اسکیمـا -------------
 def ensure_schema():
-    """ساخت خودکار جداول در صورت نبودنشان (Neon)."""
-    with get_conn() as conn:
-        cur = conn.cursor()
+    ddl = """
+    CREATE TABLE IF NOT EXISTS users (
+        telegram_id BIGINT PRIMARY KEY,
+        name        TEXT,
+        phone       TEXT,
+        address     TEXT,
+        wallet_balance INTEGER NOT NULL DEFAULT 0,
+        created_at  TIMESTAMP DEFAULT NOW()
+    );
 
-        # === users
-        # توجه: ستون اصلی id است (همان آیدی تلگرام). قبلاً telegram_id بود که حذف شده.
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id BIGINT PRIMARY KEY,
-            name TEXT,
-            phone TEXT,
-            address TEXT,
-            wallet INTEGER DEFAULT 0,
-            cashback INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        """)
+    CREATE TABLE IF NOT EXISTS products (
+        id SERIAL PRIMARY KEY,
+        name TEXT NOT NULL,
+        price INTEGER NOT NULL,
+        photo_url TEXT,
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
 
-        # === products
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            price INTEGER NOT NULL,
-            photo_url TEXT
-        );
-        """)
+    CREATE TABLE IF NOT EXISTS orders (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+        items JSONB NOT NULL,
+        total_amount INTEGER NOT NULL,
+        cashback INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TIMESTAMP DEFAULT NOW()
+    );
 
-        # === orders
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-            total_price INTEGER NOT NULL,
-            status TEXT DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        """)
+    CREATE TABLE IF NOT EXISTS wallet_tx (
+        id SERIAL PRIMARY KEY,
+        user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+        amount INTEGER NOT NULL,         -- مثبت: شارژ / منفی: خرید
+        kind TEXT NOT NULL,              -- 'topup_card','order','cashback','manual'
+        meta JSONB,
+        created_at TIMESTAMP DEFAULT NOW()
+    );
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(ddl)
 
-        # === order_items
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS order_items (
-            id SERIAL PRIMARY KEY,
-            order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
-            product_id INTEGER REFERENCES products(id),
-            qty INTEGER NOT NULL DEFAULT 1,
-            price_each INTEGER NOT NULL
-        );
-        """)
+# برای فراخوانی در استارت‌آپ
+def init_db():
+    """Called on startup by handlers.startup_warmup()"""
+    ensure_schema()
 
-        conn.commit()
-        cur.close()
+# ------------ توابع کاربردی که handlers صدا می‌زند -------------
 
-# ========== کاربران ==========
-def upsert_user(user_id: int, name: str | None = None):
-    """ساخت/به‌روزرسانی کاربر با کلید اصلی id (آیدی تلگرام)."""
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (id, name)
-            VALUES (%s, %s)
-            ON CONFLICT (id) DO UPDATE
-            SET name = COALESCE(EXCLUDED.name, users.name)
-        """, (user_id, name))
-        conn.commit()
-        cur.close()
+def upsert_user(telegram_id: int, name: str | None):
+    sql = """
+    INSERT INTO users (telegram_id, name)
+    VALUES (%s, %s)
+    ON CONFLICT (telegram_id)
+    DO UPDATE SET name = COALESCE(EXCLUDED.name, users.name);
+    """
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, (telegram_id, name))
 
-def get_user(user_id: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, name, phone, address, wallet, cashback FROM users WHERE id = %s", (user_id,))
+def get_wallet(telegram_id: int) -> int:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT wallet_balance FROM users WHERE telegram_id=%s;", (telegram_id,))
         row = cur.fetchone()
-        cur.close()
-        if not row:
-            return None
-        return {
-            "id": row[0], "name": row[1], "phone": row[2], "address": row[3],
-            "wallet": row[4], "cashback": row[5]
-        }
+        return int(row[0]) if row else 0
 
-def set_user_contact(user_id: int, name: str | None, phone: str | None, address: str | None):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO users (id, name, phone, address)
-            VALUES (%s, %s, %s, %s)
-            ON CONFLICT (id) DO UPDATE
-            SET name = COALESCE(EXCLUDED.name, users.name),
-                phone = COALESCE(EXCLUDED.phone, users.phone),
-                address = COALESCE(EXCLUDED.address, users.address)
-        """, (user_id, name, phone, address))
-        conn.commit()
-        cur.close()
+def change_wallet(telegram_id: int, delta: int, kind: str, meta: dict | None = None):
+    with get_conn() as conn, conn.cursor() as cur:
+        # مطمئن شو کاربر وجود دارد
+        cur.execute("INSERT INTO users (telegram_id) VALUES (%s) ON CONFLICT DO NOTHING;", (telegram_id,))
+        # لاگ تراکنش
+        cur.execute(
+            "INSERT INTO wallet_tx (user_id, amount, kind, meta) VALUES (%s,%s,%s,%s);",
+            (telegram_id, delta, kind, Json(meta or {})),
+        )
+        # بروزرسانی موجودی
+        cur.execute(
+            "UPDATE users SET wallet_balance = wallet_balance + %s WHERE telegram_id=%s;",
+            (delta, telegram_id),
+        )
 
-# ========== کیف پول ==========
-def change_wallet(user_id: int, delta: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE users
-               SET wallet = COALESCE(wallet, 0) + %s
-             WHERE id = %s
-        """, (delta, user_id))
-        conn.commit()
-        cur.close()
+def list_products(active_only: bool = True):
+    sql = "SELECT id, name, price, photo_url, is_active FROM products"
+    if active_only:
+        sql += " WHERE is_active = TRUE"
+    sql += " ORDER BY id;"
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql)
+        return cur.fetchall()
 
-def add_cashback(user_id: int, amount: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            UPDATE users
-               SET cashback = COALESCE(cashback, 0) + %s
-             WHERE id = %s
-        """, (amount, user_id))
-        conn.commit()
-        cur.close()
+def add_product(name: str, price: int, photo_url: str | None):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO products (name, price, photo_url) VALUES (%s,%s,%s) RETURNING id;",
+            (name, price, photo_url),
+        )
+        return cur.fetchone()[0]
 
-# ========== محصولات ==========
-def add_product(title: str, price: int, photo_url: str | None):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO products (title, price, photo_url)
-            VALUES (%s, %s, %s)
-            RETURNING id
-        """, (title, price, photo_url))
-        pid = cur.fetchone()[0]
-        conn.commit()
-        cur.close()
-        return pid
+def update_product(pid: int, name: str | None = None, price: int | None = None,
+                   photo_url: str | None = None, is_active: bool | None = None):
+    sets, vals = [], []
+    if name is not None:
+        sets.append("name=%s"); vals.append(name)
+    if price is not None:
+        sets.append("price=%s"); vals.append(price)
+    if photo_url is not None:
+        sets.append("photo_url=%s"); vals.append(photo_url)
+    if is_active is not None:
+        sets.append("is_active=%s"); vals.append(is_active)
+    if not sets:
+        return
+    vals.append(pid)
+    sql = "UPDATE products SET " + ", ".join(sets) + " WHERE id=%s;"
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(sql, tuple(vals))
 
-def list_products():
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT id, title, price, photo_url FROM products ORDER BY id DESC")
-        rows = cur.fetchall()
-        cur.close()
-        return [{"id": r[0], "title": r[1], "price": r[2], "photo": r[3]} for r in rows]
-
-def delete_product(pid: int):
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM products WHERE id = %s", (pid,))
-        conn.commit()
-        cur.close()
-
-# ========== سفارش ==========
-def create_order(user_id: int, items: list[tuple[int, int, int]]):
-    """
-    items: لیست تاپل‌ها به شکل (product_id, qty, price_each)
-    """
-    total = sum(q * p for _, q, p in items)
-    with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute("INSERT INTO orders (user_id, total_price) VALUES (%s, %s) RETURNING id", (user_id, total))
-        order_id = cur.fetchone()[0]
-        for product_id, qty, price_each in items:
-            cur.execute("""
-                INSERT INTO order_items (order_id, product_id, qty, price_each)
-                VALUES (%s, %s, %s, %s)
-            """, (order_id, product_id, qty, price_each))
-        conn.commit()
-        cur.close()
-        return order_id, total
+def create_order(telegram_id: int, items: list[dict], total_amount: int, cashback: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO orders (user_id, items, total_amount, cashback) VALUES (%s,%s,%s,%s) RETURNING id;",
+            (telegram_id, Json(items), total_amount, cashback),
+        )
+        return cur.fetchone()[0]
