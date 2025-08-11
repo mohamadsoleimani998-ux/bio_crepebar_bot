@@ -1,144 +1,170 @@
+from __future__ import annotations
 import psycopg2
-from psycopg2.extras import RealDictCursor
-from typing import Optional, List, Dict, Tuple
-from .base import DATABASE_URL, CASHBACK_PERCENT
+import psycopg2.extras
+from contextlib import contextmanager
+from typing import Any, Iterable
+from .base import SETTINGS
 
+# اتصال ساده؛ هر کوئری یک کانکشن کوتاه‌مدت می‌گیرد (برای Render/Neon امن‌تر است)
+@contextmanager
 def _conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    conn = psycopg2.connect(SETTINGS.DATABASE_URL, sslmode="require")
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 def init_db() -> None:
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id     BIGINT PRIMARY KEY,
-            username    TEXT,
-            full_name   TEXT,
-            phone       TEXT,
-            address     TEXT,
-            wallet      BIGINT DEFAULT 0,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS products(
-            id          BIGSERIAL PRIMARY KEY,
-            name        TEXT NOT NULL,
-            price       BIGINT NOT NULL,
-            image_url   TEXT,
-            available   BOOLEAN DEFAULT TRUE,
-            created_at  TIMESTAMPTZ DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS orders(
-            id          BIGSERIAL PRIMARY KEY,
-            user_id     BIGINT NOT NULL REFERENCES users(user_id),
-            product_id  BIGINT NOT NULL REFERENCES products(id),
-            qty         INT NOT NULL,
-            total       BIGINT NOT NULL,
-            cash_back   BIGINT NOT NULL DEFAULT 0,
-            name        TEXT,
-            phone       TEXT,
-            address     TEXT,
-            status      TEXT DEFAULT 'pending',
-            created_at  TIMESTAMPTZ DEFAULT NOW()
-        );
-        CREATE TABLE IF NOT EXISTS topups(
-            id          BIGSERIAL PRIMARY KEY,
-            user_id     BIGINT NOT NULL REFERENCES users(user_id),
-            amount      BIGINT NOT NULL,
-            method      TEXT NOT NULL,   -- 'card_to_card' | 'gateway'
-            status      TEXT DEFAULT 'pending',
-            created_at  TIMESTAMPTZ DEFAULT NOW()
-        );
-        """)
-    # اندکس‌های سبک
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);")
+    sql = """
+    CREATE TABLE IF NOT EXISTS users(
+        id BIGINT PRIMARY KEY,
+        tg_username TEXT,
+        full_name TEXT,
+        phone TEXT,
+        address TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
 
-# ---- Users ----
-def get_or_create_user(user_id:int, username:str, full_name:str) -> Dict:
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("SELECT * FROM users WHERE user_id=%s;", (user_id,))
-        row = cur.fetchone()
-        if row:
-            return row
-        cur.execute("""INSERT INTO users(user_id, username, full_name)
-                       VALUES(%s,%s,%s) RETURNING *;""",
-                    (user_id, username, full_name))
-        return cur.fetchone()
+    CREATE TABLE IF NOT EXISTS wallets(
+        user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        balance BIGINT NOT NULL DEFAULT 0
+    );
 
-def update_user_contact(user_id:int, phone:str=None, address:str=None, full_name:str=None):
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("""
-        UPDATE users SET
-          phone = COALESCE(%s, phone),
-          address = COALESCE(%s, address),
-          full_name = COALESCE(%s, full_name)
-        WHERE user_id=%s;""", (phone, address, full_name, user_id))
+    CREATE TABLE IF NOT EXISTS wallet_tx(
+        id BIGSERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+        amount BIGINT NOT NULL,          -- + شارژ / - برداشت
+        kind TEXT NOT NULL,              -- deposit|order|refund|manual
+        meta JSONB DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
 
-def get_wallet(user_id:int) -> int:
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("SELECT wallet FROM users WHERE user_id=%s;", (user_id,))
-        row = cur.fetchone()
-        return int(row["wallet"]) if row else 0
+    CREATE TABLE IF NOT EXISTS products(
+        id BIGSERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        price BIGINT NOT NULL,           -- تومان
+        photo_id TEXT,                   -- file_id تلگرام یا URL
+        is_active BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
 
-def add_wallet(user_id:int, amount:int):
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("UPDATE users SET wallet = wallet + %s WHERE user_id=%s;", (amount, user_id))
+    CREATE TABLE IF NOT EXISTS orders(
+        id BIGSERIAL PRIMARY KEY,
+        user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        customer_name TEXT,
+        customer_phone TEXT,
+        customer_address TEXT,
+        subtotal BIGINT NOT NULL DEFAULT 0,
+        cashback BIGINT NOT NULL DEFAULT 0,
+        paid_from_wallet BIGINT NOT NULL DEFAULT 0,
+        total BIGINT NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'new', -- new|paid|canceled|delivered
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
 
-# ---- Products ----
-def list_products(only_available:bool=True) -> List[Dict]:
-    q = "SELECT * FROM products"
-    if only_available:
-        q += " WHERE available = TRUE"
-    q += " ORDER BY id DESC"
-    with _conn() as con, con.cursor() as cur:
-        cur.execute(q)
-        return list(cur.fetchall())
+    CREATE TABLE IF NOT EXISTS order_items(
+        id BIGSERIAL PRIMARY KEY,
+        order_id BIGINT REFERENCES orders(id) ON DELETE CASCADE,
+        product_id BIGINT REFERENCES products(id) ON DELETE SET NULL,
+        title TEXT NOT NULL,
+        qty INT NOT NULL DEFAULT 1,
+        unit_price BIGINT NOT NULL
+    );
+    """
+    exec_sql(sql)
 
-def get_product(pid:int) -> Optional[Dict]:
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("SELECT * FROM products WHERE id=%s;", (pid,))
-        return cur.fetchone()
+def exec_sql(sql: str, params: Iterable[Any] | None = None):
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(sql, params or ())
+            c.commit()
 
-def add_product(name:str, price:int, image_url:str=None, available:bool=True) -> int:
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("""INSERT INTO products(name, price, image_url, available)
-                       VALUES(%s,%s,%s,%s) RETURNING id;""",
-                    (name, price, image_url, available))
-        return int(cur.fetchone()["id"])
+def fetchall(sql: str, params: Iterable[Any] | None = None) -> list[dict]:
+    with _conn() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params or ())
+            return [dict(r) for r in cur.fetchall()]
 
-def edit_product(pid:int, name:str=None, price:int=None, image_url:str=None, available:bool=None):
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("""
-        UPDATE products SET
-          name = COALESCE(%s, name),
-          price = COALESCE(%s, price),
-          image_url = COALESCE(%s, image_url),
-          available = COALESCE(%s, available)
-        WHERE id=%s;""", (name, price, image_url, available, pid))
+def fetchone(sql: str, params: Iterable[Any] | None = None) -> dict | None:
+    with _conn() as c:
+        with c.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, params or ())
+            row = cur.fetchone()
+            return dict(row) if row else None
 
-def delete_product(pid:int):
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("DELETE FROM products WHERE id=%s;", (pid,))
+# --- Users & Wallets ---------------------------------------------------------
+def upsert_user(user_id: int, username: str | None, full_name: str | None) -> None:
+    sql = """
+    INSERT INTO users(id, tg_username, full_name)
+    VALUES(%s, %s, %s)
+    ON CONFLICT (id) DO UPDATE SET tg_username=EXCLUDED.tg_username,
+                                  full_name=EXCLUDED.full_name;
+    INSERT INTO wallets(user_id, balance) VALUES(%s, 0)
+    ON CONFLICT DO NOTHING;
+    """
+    exec_sql(sql, (user_id, username, full_name, user_id))
 
-# ---- Orders ----
-def create_order(user_id:int, product_id:int, qty:int, name:str, phone:str, address:str) -> Tuple[int, int, int]:
-    prod = get_product(product_id)
-    if not prod:
-        raise ValueError("محصول پیدا نشد")
-    total = int(prod["price"]) * int(qty)
-    cash_back = (total * CASHBACK_PERCENT) // 100 if CASHBACK_PERCENT > 0 else 0
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("""INSERT INTO orders(user_id, product_id, qty, total, cash_back, name, phone, address)
-                       VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id;""",
-                    (user_id, product_id, qty, total, cash_back, name, phone, address))
-        order_id = int(cur.fetchone()["id"])
-        # شارژ کش‌بک بعد از ایجاد سفارش (می‌توان بعد از تحویل هم اعمال کرد؛ اینجا ساده)
-        if cash_back:
-            cur.execute("UPDATE users SET wallet = wallet + %s WHERE user_id=%s;", (cash_back, user_id))
-    return order_id, total, cash_back
+def update_profile(user_id: int, phone: str, address: str, name: str) -> None:
+    exec_sql("UPDATE users SET phone=%s, address=%s, full_name=%s WHERE id=%s",
+             (phone, address, name, user_id))
 
-# ---- Topup ----
-def create_topup(user_id:int, amount:int, method:str) -> int:
-    with _conn() as con, con.cursor() as cur:
-        cur.execute("""INSERT INTO topups(user_id, amount, method)
-                       VALUES(%s,%s,%s) RETURNING id;""", (user_id, amount, method))
-        return int(cur.fetchone()["id"])
+def get_wallet(user_id: int) -> int:
+    row = fetchone("SELECT balance FROM wallets WHERE user_id=%s", (user_id,))
+    return int(row["balance"]) if row else 0
+
+def add_wallet_tx(user_id: int, amount: int, kind: str, meta: dict | None = None) -> None:
+    exec_sql("INSERT INTO wallet_tx(user_id, amount, kind, meta) VALUES(%s,%s,%s,%s)",
+             (user_id, amount, kind, psycopg2.extras.Json(meta or {})))
+    exec_sql("UPDATE wallets SET balance = balance + %s WHERE user_id=%s", (amount, user_id))
+
+# --- Products ----------------------------------------------------------------
+def add_product(title: str, price: int, photo_id: str | None) -> int:
+    row = fetchone(
+        "INSERT INTO products(title, price, photo_id) VALUES(%s,%s,%s) RETURNING id",
+        (title, price, photo_id),
+    )
+    return int(row["id"])
+
+def list_products(active_only: bool = True) -> list[dict]:
+    if active_only:
+        return fetchall("SELECT * FROM products WHERE is_active=TRUE ORDER BY id DESC")
+    return fetchall("SELECT * FROM products ORDER BY id DESC")
+
+def set_product_active(pid: int, active: bool) -> None:
+    exec_sql("UPDATE products SET is_active=%s WHERE id=%s", (active, pid))
+
+# --- Orders ------------------------------------------------------------------
+def create_order(user_id: int, name: str, phone: str, address: str,
+                 items: list[dict], cashback_percent: int) -> int:
+    # subtotal
+    subtotal = sum(int(i["qty"]) * int(i["unit_price"]) for i in items)
+    cashback = subtotal * cashback_percent // 100
+    paid_from_wallet = 0
+    total = max(subtotal - paid_from_wallet - cashback, 0)
+
+    row = fetchone("""
+        INSERT INTO orders(user_id, customer_name, customer_phone, customer_address,
+                           subtotal, cashback, paid_from_wallet, total)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+    """, (user_id, name, phone, address, subtotal, cashback, paid_from_wallet, total))
+    order_id = int(row["id"])
+
+    for it in items:
+        exec_sql("""
+            INSERT INTO order_items(order_id, product_id, title, qty, unit_price)
+            VALUES(%s,%s,%s,%s,%s)
+        """, (order_id, it.get("product_id"), it["title"], it["qty"], it["unit_price"]))
+
+    # ثبت کش‌بک به کیف پول
+    if cashback > 0:
+        add_wallet_tx(user_id, cashback, "cashback", {"order_id": order_id})
+
+    return order_id
+
+def get_order(order_id: int) -> dict | None:
+    o = fetchone("SELECT * FROM orders WHERE id=%s", (order_id,))
+    if not o:
+        return None
+    items = fetchall("SELECT * FROM order_items WHERE order_id=%s", (order_id,))
+    o["items"] = items
+    return o
