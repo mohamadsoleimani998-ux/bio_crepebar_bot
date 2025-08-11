@@ -1,32 +1,25 @@
-# src/bot.py
-from telegram.ext import Application, ApplicationBuilder
-from .base import BOT_TOKEN, PUBLIC_URL, PORT, ADMIN_IDS
+from __future__ import annotations
+import asyncio
+from telegram.ext import Application
+from .base import SETTINGS
 from .handlers import register
-from .db import init_db
 
+# نکته: Start Command در Render =  python -m src.bot
+# این فایل، وبهوک PTB را مستقیم بالا می‌آورد (نیازی به uvicorn و ... نیست)
 
 def main():
-    # دیتابیس را همین ابتدای اجرا بالا می‌آوریم تا نیاز به JobQueue نباشد
-    init_db()
+    application = Application.builder().token(SETTINGS.BOT_TOKEN).build()
 
-    application: Application = ApplicationBuilder().token(BOT_TOKEN).build()
-    # لیست ادمین‌ها را در bot_data می‌گذاریم (اگر جای دیگری استفاده می‌شود)
-    application.bot_data["admin_ids"] = list(ADMIN_IDS)
-
-    # همهٔ هندلرها
+    # ثبت هندلرها
     register(application)
 
-    # اگر آدرس پابلیک (Render) ست شده، با وبهوک اجرا کن؛ وگرنه Polling
-    if PUBLIC_URL:
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            webhook_url=f"{PUBLIC_URL}/webhook",
-            drop_pending_updates=True,
-        )
-    else:
-        application.run_polling(drop_pending_updates=True)
-
+    # راه‌اندازی Webhook (بدون آرگومان path چون در PTB20.6 وجود ندارد)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=SETTINGS.PORT,
+        webhook_url=f"{SETTINGS.PUBLIC_URL}/{SETTINGS.BOT_TOKEN}",
+        secret_token=None,  # در صورت نیاز می‌توان از Secret Token استفاده کرد
+    )
 
 if __name__ == "__main__":
     main()
