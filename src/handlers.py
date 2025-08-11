@@ -1,20 +1,22 @@
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ConversationHandler,
     CallbackQueryHandler, filters, ContextTypes
 )
-from .base import ADMIN_IDS, CASHBACK_PERCENT
-import .db as db  # relative import داخل پکیج src
 
-# حالت‌های گفت‌وگو
+from .base import ADMIN_IDS, CASHBACK_PERCENT
+from . import db   # ✅ relative import صحیح
+
+# ---- states ----
 ASK_NAME, ASK_PHONE, ASK_ADDRESS = range(3)
 ORDER_PICK, ORDER_QTY, ORDER_NOTE, ORDER_CONFIRM = range(3, 7)
-TOPUP_AMOUNT, TOPUP_METHOD, TOPUP_SUBMIT = range(7, 10)
+TOPUP_AMOUNT, TOPUP_METHOD = range(7, 9)
+CONTACT_STATE = 100
 
-# کیبورد فارسی
+# ---- keyboards ----
 MAIN_KB = ReplyKeyboardMarkup(
     [
         ["منو", "سفارش"],
@@ -25,33 +27,35 @@ MAIN_KB = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+def is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
 
+# ---------- start/help ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     db.upsert_user(u.id, u.full_name)
     await update.message.reply_text(
-        "سلام! به ربات خوش آمدید.\nاز کیبورد پایین یکی را انتخاب کنید.",
+        "سلام! به ربات خوش آمدید.\nاز دکمه‌های پایین استفاده کنید.",
         reply_markup=MAIN_KB
     )
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("از دکمه‌های پایین استفاده کنید.", reply_markup=MAIN_KB)
+    await update.message.reply_text("راهنما: از دکمه‌های پایین استفاده کنید.", reply_markup=MAIN_KB)
 
-# ---------- اطلاعات کاربر ----------
+# ---------- user info ----------
 async def ensure_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     tg_id = update.effective_user.id
     user = db.get_user(tg_id)
     if user and user.get("phone") and user.get("address"):
-        await update.message.reply_text("اطلاعات شما قبلا ثبت شده است.", reply_markup=MAIN_KB)
+        await update.message.reply_text("اطلاعات شما قبلاً ثبت شده است.", reply_markup=MAIN_KB)
         return ConversationHandler.END
     await update.message.reply_text("نام خود را وارد کنید:")
     return ASK_NAME
 
 async def ask_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["name"] = update.message.text.strip()
-    kb = ReplyKeyboardMarkup([[KeyboardButton("ارسال شماره من", request_contact=True)]], resize_keyboard=True, one_time_keyboard=True)
+    kb = ReplyKeyboardMarkup([[KeyboardButton("ارسال شماره من", request_contact=True)]],
+                             resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("شماره تماس را ارسال کنید:", reply_markup=kb)
     return ASK_PHONE
 
@@ -69,7 +73,7 @@ async def save_user_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("اطلاعات شما ذخیره شد ✅", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
-# ---------- منو محصولات ----------
+# ---------- products ----------
 def product_rows():
     products = db.list_products()
     rows = []
@@ -77,27 +81,27 @@ def product_rows():
         text = f"{p['name']} • {p['price']} تومان"
         rows.append([InlineKeyboardButton(text, callback_data=f"order:{p['id']}")])
     if not rows:
-        rows = [[InlineKeyboardButton("فعلا محصولی ثبت نشده", callback_data="noop")]]
+        rows = [[InlineKeyboardButton("فعلاً محصولی ثبت نشده", callback_data="noop")]]
     return rows
 
 async def menu_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup(product_rows())
     await update.message.reply_text("منوی محصولات:", reply_markup=kb)
 
-# ---------- سفارش ----------
+# ---------- order ----------
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup(product_rows())
     await update.message.reply_text("یک محصول انتخاب کنید:", reply_markup=kb)
     return ORDER_PICK
 
 async def order_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not query.data.startswith("order:"):
+    q = update.callback_query
+    await q.answer()
+    if not q.data.startswith("order:"):
         return ConversationHandler.END
-    prod_id = int(query.data.split(":")[1])
+    prod_id = int(q.data.split(":")[1])
     context.user_data["order_prod"] = prod_id
-    await query.edit_message_text("تعداد را بنویسید (مثلا 2):")
+    await q.edit_message_text("تعداد را بنویسید (مثلاً 2):")
     return ORDER_QTY
 
 async def order_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,16 +119,14 @@ async def order_qty(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def order_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = update.message.text.strip()
     context.user_data["order_note"] = "" if note == "-" else note
-    # جمع کل
     prod = next((p for p in db.list_products() if p["id"] == context.user_data["order_prod"]), None)
     if not prod:
         await update.message.reply_text("محصول یافت نشد.")
         return ConversationHandler.END
     qty = context.user_data["order_qty"]
     total = prod["price"] * qty
-    context.user_data["order_total"] = total
     cback = (total * CASHBACK_PERCENT) // 100
-    context.user_data["order_cashback"] = cback
+    context.user_data.update(order_total=total, order_cashback=cback)
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("تایید سفارش ✅", callback_data="confirm")],
         [InlineKeyboardButton("انصراف ❌", callback_data="cancel")]
@@ -134,21 +136,21 @@ async def order_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ORDER_CONFIRM
 
 async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "cancel":
-        await query.edit_message_text("سفارش لغو شد.")
+    q = update.callback_query
+    await q.answer()
+    if q.data == "cancel":
+        await q.edit_message_text("سفارش لغو شد.")
         return ConversationHandler.END
 
-    tg_id = query.from_user.id
+    tg_id = q.from_user.id
     user = db.get_user(tg_id)
     if not user or not user.get("phone") or not user.get("address"):
-        await query.edit_message_text("ابتدا اطلاعات پروفایل (نام/شماره/آدرس) را تکمیل کنید.")
+        await q.edit_message_text("ابتدا اطلاعات (نام/شماره/آدرس) را تکمیل کنید: «ثبت اطلاعات».")
         return ConversationHandler.END
 
     prod = next((p for p in db.list_products() if p["id"] == context.user_data["order_prod"]), None)
     if not prod:
-        await query.edit_message_text("محصول یافت نشد.")
+        await q.edit_message_text("محصول یافت نشد.")
         return ConversationHandler.END
 
     qty = context.user_data["order_qty"]
@@ -157,26 +159,24 @@ async def order_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     note = context.user_data.get("order_note")
 
     order_id = db.create_order(tg_id, [{"product_id": prod["id"], "qty": qty}], total, cback, note)
-    # اعمال کش‌بک
     if cback > 0:
-        new_balance = db.change_wallet(tg_id, cback)
+        db.change_wallet(tg_id, cback)
 
-    await query.edit_message_text(f"سفارش ثبت شد ✅\nشماره سفارش: {order_id}\nکش‌بک: {cback} تومان")
+    await q.edit_message_text(f"سفارش ثبت شد ✅\nشماره سفارش: {order_id}\nکش‌بک: {cback} تومان")
 
-    # پیام برای ادمین
     for admin_id in ADMIN_IDS:
         try:
-            await query.bot.send_message(
-                chat_id=admin_id,
-                text=f"🔔 سفارش جدید #{order_id}\nکاربر: {query.from_user.full_name} ({tg_id})\n"
-                     f"محصول: {prod['name']} × {qty}\nمبلغ: {total} تومان\nیادداشت: {note or '-'}"
+            await q.bot.send_message(
+                admin_id,
+                f"🔔 سفارش جدید #{order_id}\nکاربر: {q.from_user.full_name} ({tg_id})\n"
+                f"محصول: {prod['name']} × {qty}\nمبلغ: {total} تومان\nیادداشت: {note or '-'}"
             )
         except Exception:
             pass
 
     return ConversationHandler.END
 
-# ---------- کیف پول ----------
+# ---------- wallet ----------
 async def wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = db.get_user(update.effective_user.id)
     bal = u["wallet_balance"] if u else 0
@@ -208,33 +208,29 @@ async def topup_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     method = "card_to_card" if q.data == "card" else "gateway"
-    context.user_data["topup_method"] = method
-    topup_id = db.create_topup(q.from_user.id, context.user_data["topup_amount"], method)
+    amount = context.user_data["topup_amount"]
+    topup_id = db.create_topup(q.from_user.id, amount, method)
     await q.edit_message_text(
         f"درخواست شارژ ثبت شد (#{topup_id}).\n"
         f"روش: {'کارت به کارت' if method=='card_to_card' else 'درگاه'}\n"
         f"لطفاً رسید را برای ادمین ارسال کنید تا تایید شود."
     )
-    # اطلاع به ادمین
     for admin_id in ADMIN_IDS:
         try:
-            await q.bot.send_message(
-                admin_id, f"🟡 درخواست شارژ #{topup_id} از {q.from_user.full_name} ({q.from_user.id})"
-            )
+            await q.bot.send_message(admin_id, f"🟡 درخواست شارژ #{topup_id} از {q.from_user.full_name} ({q.from_user.id})")
         except Exception:
             pass
     return ConversationHandler.END
 
-# ---------- بخش بازی (ساده) ----------
+# ---------- game / contact ----------
 async def game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     import random
     n = random.randint(1, 6)
-    await update.message.reply_text(f"🎲 عدد شما: {n}\n(صرفاً برای سرگرمی)")
+    await update.message.reply_text(f"🎲 عدد شما: {n}")
 
-# ---------- ارتباط با ما ----------
 async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("پیام خود را بنویسید تا برای ادمین ارسال شود.")
-    return 100  # state موقتی
+    return CONTACT_STATE
 
 async def contact_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message.text
@@ -246,11 +242,10 @@ async def contact_forward(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("پیامتان ارسال شد ✅", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
-# ---------- ادمین: افزودن/ویرایش/حذف محصول ----------
+# ---------- admin ----------
 async def admin_add_product(update, context):
     if not is_admin(update.effective_user.id):
         return
-    # فرمت: افزودن محصول (ادمین) نام | قیمت | لینک‌عکس(اختیاری)
     text = (update.message.text or "").replace("افزودن محصول (ادمین)", "").strip()
     if "|" not in text:
         await update.message.reply_text("فرمت: نام | قیمت | لینک‌عکس(اختیاری)")
@@ -269,7 +264,6 @@ async def admin_add_product(update, context):
 async def admin_edit_product(update, context):
     if not is_admin(update.effective_user.id):
         return
-    # فرمت: ویرایش محصول (ادمین) id | نام(اختیاری) | قیمت(اختیاری) | لینک‌عکس(اختیاری)
     text = (update.message.text or "").replace("ویرایش محصول (ادمین)", "").strip()
     if "|" not in text:
         await update.message.reply_text("فرمت: id | نام(اختیاری) | قیمت(اختیاری) | لینک‌عکس(اختیاری)")
@@ -285,7 +279,6 @@ async def admin_edit_product(update, context):
 async def admin_delete_product(update, context):
     if not is_admin(update.effective_user.id):
         return
-    # فرمت: حذف محصول id
     parts = (update.message.text or "").split()
     if len(parts) < 3:
         await update.message.reply_text("فرمت: حذف محصول id")
@@ -294,16 +287,13 @@ async def admin_delete_product(update, context):
     db.delete_product(prod_id)
     await update.message.reply_text("محصول حذف شد 🗑️")
 
-# ---------- ثبت هندلرها ----------
+# ---------- register ----------
 def register(application: Application):
-    # استارت و کمک
     application.add_handler(CommandHandler(["start", "help"], start))
     application.add_handler(MessageHandler(filters.Regex("^(/help|راهنما)$"), help_cmd))
 
-    # منو
     application.add_handler(MessageHandler(filters.Regex("^(منو|/products)$"), menu_products))
 
-    # پروفایل/اطلاعات
     profile_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^ثبت اطلاعات$"), ensure_user_info)],
         states={
@@ -315,7 +305,6 @@ def register(application: Application):
     )
     application.add_handler(profile_conv)
 
-    # سفارش
     order_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^(سفارش|/order)$"), order_start)],
         states={
@@ -328,8 +317,8 @@ def register(application: Application):
     )
     application.add_handler(order_conv)
 
-    # کیف پول
     application.add_handler(MessageHandler(filters.Regex("^(کیف پول|/wallet)$"), wallet))
+
     topup_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^شارژ کیف پول$"), topup_start)],
         states={
@@ -340,20 +329,17 @@ def register(application: Application):
     )
     application.add_handler(topup_conv)
 
-    # بازی/ارتباط
     application.add_handler(MessageHandler(filters.Regex("^(بازی|/game)$"), game))
     contact_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^(ارتباط با ما|/contact)$"), contact)],
-        states={100: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact_forward)]},
+        states={CONTACT_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact_forward)]},
         fallbacks=[]
     )
     application.add_handler(contact_conv)
 
-    # ادمین‌ها
     application.add_handler(MessageHandler(filters.Regex("^افزودن محصول \\(ادمین\\).+"), admin_add_product))
     application.add_handler(MessageHandler(filters.Regex("^ویرایش محصول \\(ادمین\\).+"), admin_edit_product))
     application.add_handler(MessageHandler(filters.Regex("^حذف محصول \\d+$"), admin_delete_product))
 
 def startup_warmup(application: Application):
-    # ساخت جداول در استارت
     db.init_db()
