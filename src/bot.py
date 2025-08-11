@@ -1,6 +1,6 @@
 import os
 from telegram.ext import Application
-from handlers import register
+from src.handlers import register
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
