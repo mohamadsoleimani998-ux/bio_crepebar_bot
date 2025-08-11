@@ -1,44 +1,34 @@
 import os
-from dataclasses import dataclass
-from dotenv import load_dotenv
 
-# Render هنگام اجرا خودش env رو ست می‌کند؛ برای لوکال هم از .env پشتیبانی شود
-load_dotenv(override=False)
+def env(name: str, default: str | None = None) -> str:
+    val = os.getenv(name, default)
+    if val is None:
+        raise RuntimeError(f"Required env var {name} is not set")
+    return val
 
-@dataclass(frozen=True)
-class Settings:
-    BOT_TOKEN: str
-    DATABASE_URL: str
-    PUBLIC_URL: str
-    ADMIN_IDS: tuple[int, ...]
-    CASHBACK_PERCENT: int
-    PORT: int
+# توکن را از TELEGRAM_TOKEN یا BOT_TOKEN بردار
+BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
 
-def _parse_admins(value: str | None) -> tuple[int, ...]:
-    if not value:
-        return tuple()
-    return tuple(int(x.strip()) for x in value.replace(',', ' ').split() if x.strip().isdigit())
+# آدرس پابلیک (برای وب‌هوک)
+PUBLIC_URL = os.getenv("WEBHOOK_URL") or os.getenv("WEBHOOK_BASE") or os.getenv("PUBLIC_URL") or ""
 
-def get_settings() -> Settings:
-    token = os.getenv("BOT_TOKEN", "").strip()
-    db_url = os.getenv("DATABASE_URL", os.getenv("DATABASE_URL".lower(), "")).strip()
-    public_url = os.getenv("PUBLIC_URL", "").rstrip("/")
-    admins = _parse_admins(os.getenv("ADMIN_IDS"))
-    cashback = int(os.getenv("CASHBACK_PERCENT", "3"))
-    port = int(os.getenv("PORT", "10000"))
-    if not token:
-        raise RuntimeError("BOT_TOKEN is missing")
-    if not db_url:
-        raise RuntimeError("DATABASE_URL is missing")
-    if not public_url:
-        raise RuntimeError("PUBLIC_URL is missing")
-    return Settings(
-        BOT_TOKEN=token,
-        DATABASE_URL=db_url,
-        PUBLIC_URL=public_url,
-        ADMIN_IDS=admins,
-        CASHBACK_PERCENT=cashback,
-        PORT=port,
-    )
+# سِکرت وب‌هوک (اختیاری ولی بهتر است داشته باشی)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
 
-SETTINGS = get_settings()
+# پورت سرویس روی Render
+PORT = int(os.getenv("PORT", "5000"))
+
+# درصد کش‌بک
+try:
+    CASHBACK_PERCENT = int(os.getenv("CASHBACK_PERCENT", "0"))
+except ValueError:
+    CASHBACK_PERCENT = 0
+
+# ادمین‌ها (با کاما یا فاصله)
+_admin_raw = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS = set()
+for x in _admin_raw.replace(",", " ").split():
+    if x.isdigit():
+        ADMIN_IDS.add(int(x))
+
+DATABASE_URL = env("DATABASE_URL")
