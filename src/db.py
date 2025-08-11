@@ -1,155 +1,201 @@
 import os
-import json
 import psycopg2
-from psycopg2.extras import Json
-from datetime import datetime
+import psycopg2.extras
+from contextlib import contextmanager
+from typing import Optional, List, Tuple, Dict, Any
 
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL".upper()) or os.getenv("DATABASE_URL".lower())
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL env is missing")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 
-_conn = psycopg2.connect(DATABASE_URL)
-_conn.autocommit = True
+@contextmanager
+def get_conn():
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
 
-def _init():
-    with _conn.cursor() as cur:
-        # کاربران
+def init_db():
+    with get_conn() as conn:
+        cur = conn.cursor()
         cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
+        CREATE TABLE IF NOT EXISTS users(
             id SERIAL PRIMARY KEY,
             user_id BIGINT UNIQUE NOT NULL,
-            name TEXT,
+            first_name TEXT,
+            last_name TEXT,
             phone TEXT,
             address TEXT,
-            wallet BIGINT NOT NULL DEFAULT 0,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            created_at TIMESTAMP DEFAULT NOW()
         );
-        """)
-        # محصولات
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS products (
+        CREATE TABLE IF NOT EXISTS products(
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
-            price BIGINT NOT NULL,
+            price INT NOT NULL,
             photo_url TEXT,
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
         );
-        """)
-        # سفارش‌ها
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS orders (
+        CREATE TABLE IF NOT EXISTS wallets(
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT UNIQUE NOT NULL,
+            balance INT NOT NULL DEFAULT 0,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS transactions(
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
-            items JSONB NOT NULL,   -- [{"id":1,"qty":2,"name":"...", "price":30000}, ...]
-            total BIGINT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            amount INT NOT NULL,
+            kind TEXT NOT NULL,      -- 'order','cashback','topup','adjust'
+            meta TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
         );
-        """)
-        # شارژها/تراکنش‌ها
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS topups (
+        CREATE TABLE IF NOT EXISTS orders(
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
-            amount BIGINT NOT NULL,
-            method TEXT NOT NULL,   -- "card2card" | "gateway"
-            ref TEXT,
-            status TEXT NOT NULL DEFAULT 'pending',
-            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+            full_name TEXT,
+            phone TEXT,
+            address TEXT,
+            total INT NOT NULL,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS order_items(
+            id SERIAL PRIMARY KEY,
+            order_id INT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            product_id INT NOT NULL REFERENCES products(id),
+            quantity INT NOT NULL,
+            price INT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS topups(
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            amount INT NOT NULL,
+            method TEXT NOT NULL,    -- 'card'
+            note TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT NOW()
         );
         """)
+        cur.close()
 
-_init()
-
-# --- کاربران ---
-def get_or_create_user(user_id: int):
-    with _conn.cursor() as cur:
-        cur.execute("SELECT user_id, name, phone, address, wallet FROM users WHERE user_id=%s", (user_id,))
+def get_or_create_user(user_id: int, first_name: str = "", last_name: str = ""):
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT * FROM users WHERE user_id=%s;", (user_id,))
         row = cur.fetchone()
         if row:
-            return {"user_id": row[0], "name": row[1], "phone": row[2], "address": row[3], "wallet": row[4]}
-        cur.execute("INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING", (user_id,))
-        return {"user_id": user_id, "name": None, "phone": None, "address": None, "wallet": 0}
+            return row
+        cur.execute(
+            "INSERT INTO users(user_id,first_name,last_name) VALUES(%s,%s,%s) RETURNING *;",
+            (user_id, first_name, last_name)
+        )
+        return cur.fetchone()
 
-def update_user_profile(user_id: int, name=None, phone=None, address=None):
-    with _conn.cursor() as cur:
+def upsert_user_contact(user_id: int, full_name: str, phone: str, address: str):
+    with get_conn() as conn:
+        cur = conn.cursor()
         cur.execute("""
-            UPDATE users
-            SET name = COALESCE(%s, name),
-                phone = COALESCE(%s, phone),
-                address = COALESCE(%s, address)
-            WHERE user_id = %s
-        """, (name, phone, address, user_id))
+            INSERT INTO users(user_id, first_name, phone, address)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+              first_name=EXCLUDED.first_name,
+              phone=EXCLUDED.phone,
+              address=EXCLUDED.address;
+        """, (user_id, full_name, phone, address))
+
+def ensure_wallet(user_id: int):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO wallets(user_id) VALUES(%s) ON CONFLICT (user_id) DO NOTHING;", (user_id,))
 
 def get_wallet(user_id: int) -> int:
-    with _conn.cursor() as cur:
-        cur.execute("SELECT wallet FROM users WHERE user_id=%s", (user_id,))
+    ensure_wallet(user_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT balance FROM wallets WHERE user_id=%s;", (user_id,))
+        bal = cur.fetchone()
+        return int(bal[0]) if bal else 0
+
+def add_balance(user_id: int, amount: int, kind: str, meta: str = ""):
+    ensure_wallet(user_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE wallets SET balance = balance + %s WHERE user_id=%s;", (amount, user_id))
+        cur.execute("INSERT INTO transactions(user_id, amount, kind, meta) VALUES (%s,%s,%s,%s);",
+                    (user_id, amount, kind, meta))
+
+def deduct_balance(user_id: int, amount: int) -> bool:
+    ensure_wallet(user_id)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT balance FROM wallets WHERE user_id=%s FOR UPDATE;", (user_id,))
+        bal = cur.fetchone()
+        if not bal or bal[0] < amount:
+            return False
+        cur.execute("UPDATE wallets SET balance = balance - %s WHERE user_id=%s;", (amount, user_id))
+        cur.execute("INSERT INTO transactions(user_id, amount, kind) VALUES (%s,%s,'order');",
+                    (user_id, -amount))
+        return True
+
+# Products
+def add_product(name: str, price: int, photo_url: Optional[str]) -> int:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO products(name, price, photo_url) VALUES(%s,%s,%s) RETURNING id;",
+            (name, price, photo_url)
+        )
+        return cur.fetchone()[0]
+
+def list_products() -> List[Dict[str, Any]]:
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT id, name, price, photo_url FROM products WHERE is_active=TRUE ORDER BY id;")
+        return [dict(r) for r in cur.fetchall()]
+
+def get_product(pid: int) -> Optional[Dict[str, Any]]:
+    with get_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT id,name,price,photo_url FROM products WHERE id=%s AND is_active=TRUE;", (pid,))
         row = cur.fetchone()
-        return int(row[0] if row else 0)
+        return dict(row) if row else None
 
-def add_wallet(user_id: int, delta: int):
-    with _conn.cursor() as cur:
+def deactivate_product(pid: int):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE products SET is_active=FALSE WHERE id=%s;", (pid,))
+
+# Orders
+def create_order(user_id: int, full_name: str, phone: str, address: str,
+                 items: List[Tuple[int, int]]) -> int:
+    """
+    items: list of tuples (product_id, quantity)
+    """
+    with get_conn() as conn:
+        cur = conn.cursor()
+        # calc total
+        total = 0
+        prod_prices = {}
+        for pid, qty in items:
+            cur.execute("SELECT price FROM products WHERE id=%s;", (pid,))
+            r = cur.fetchone()
+            if not r:
+                continue
+            price = int(r[0])
+            prod_prices[pid] = price
+            total += price * qty
+
         cur.execute("""
-            INSERT INTO users (user_id, wallet) VALUES (%s, GREATEST(%s,0))
-            ON CONFLICT (user_id) DO UPDATE SET wallet = users.wallet + EXCLUDED.wallet
-        """, (user_id, delta))
+            INSERT INTO orders(user_id, full_name, phone, address, total)
+            VALUES (%s,%s,%s,%s,%s) RETURNING id;
+        """, (user_id, full_name, phone, address, total))
+        order_id = cur.fetchone()[0]
 
-# --- محصولات ---
-def add_product(name: str, price: int, photo_url: str | None):
-    with _conn.cursor() as cur:
-        cur.execute("INSERT INTO products (name, price, photo_url) VALUES (%s,%s,%s)", (name, price, photo_url))
-
-def edit_product(pid: int, name=None, price=None, photo_url=None):
-    with _conn.cursor() as cur:
-        cur.execute("""
-            UPDATE products
-            SET name = COALESCE(%s, name),
-                price = COALESCE(%s, price),
-                photo_url = COALESCE(%s, photo_url)
-            WHERE id = %s
-        """, (name, price, photo_url, pid))
-
-def delete_product(pid: int):
-    with _conn.cursor() as cur:
-        cur.execute("DELETE FROM products WHERE id=%s", (pid,))
-
-def list_products():
-    with _conn.cursor() as cur:
-        cur.execute("SELECT id, name, price, photo_url FROM products ORDER BY id ASC")
-        return [{"id": r[0], "name": r[1], "price": int(r[2]), "photo_url": r[3]} for r in cur.fetchall()]
-
-def get_product(pid: int):
-    with _conn.cursor() as cur:
-        cur.execute("SELECT id, name, price, photo_url FROM products WHERE id=%s", (pid,))
-        r = cur.fetchone()
-        if not r:
-            return None
-        return {"id": r[0], "name": r[1], "price": int(r[2]), "photo_url": r[3]}
-
-# --- سفارش ---
-def create_order(user_id: int, items: list[dict], total: int, status: str = "pending") -> int:
-    with _conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO orders (user_id, items, total, status) VALUES (%s, %s, %s, %s) RETURNING id",
-            (user_id, Json(items), total, status)
-        )
-        return int(cur.fetchone()[0])
-
-def list_user_orders(user_id: int):
-    with _conn.cursor() as cur:
-        cur.execute("SELECT id, items, total, status, created_at FROM orders WHERE user_id=%s ORDER BY id DESC", (user_id,))
-        out = []
-        for r in cur.fetchall():
-            out.append({"id": r[0], "items": r[1], "total": int(r[2]), "status": r[3], "created_at": r[4]})
-        return out
-
-# --- شارژ ---
-def create_topup(user_id: int, amount: int, method: str, ref: str | None):
-    with _conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO topups (user_id, amount, method, ref) VALUES (%s,%s,%s,%s)",
-            (user_id, amount, method, ref)
-        )
-
-def confirm_topup(user_id: int, amount: int):
-    add_wallet(user_id, amount)
+        for pid, qty in items:
+            if pid in prod_prices:
+                cur.execute("""
+                    INSERT INTO order_items(order_id, product_id, quantity, price)
+                    VALUES (%s,%s,%s,%s);
+                """, (order_id, pid, qty, prod_prices[pid]))
+        return order_id
