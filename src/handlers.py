@@ -1,25 +1,38 @@
-from . import db
-from .base import send_message, send_menu
+# handlers.py
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import CallbackContext
+import db
 
-async def handle_update(update: Update, context: CallbackContext):
-    """مدیریت همه پیام‌ها"""
-    text = update.message.text if update.message else ""
+ADMIN_ID = 1606170079  # آیدی ادمین
 
-    if text == "/start":
-        await send_message(update, context, "به ربات کافی‌شاپ خوش آمدید ☕️")
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="لطفاً از منوی زیر انتخاب کنید:",
-            reply_markup=send_menu()
-        )
-    elif text == "/products":
-        await send_message(update, context, "📋 لیست محصولات در حال حاضر آماده نیست.")
-    elif text == "/wallet":
-        await send_message(update, context, "💰 موجودی کیف پول شما: 0 تومان")
-    else:
-        await send_message(update, context, "دستور نامعتبر است. از منوی زیر استفاده کنید.")
+menu_keyboard = [
+    ["/products", "/wallet"],
+    ["/order", "/help"]
+]
 
-async def startup_warmup(app):
-    print("ربات با موفقیت راه‌اندازی شد ✅")
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "سلام! به ربات خوش آمدید.\n"
+        "دستورات: /products , /wallet , /order , /help\n"
+        "اگر ادمین هستید، برای افزودن محصول بعدا گزینه ادمین اضافه می‌کنیم.",
+        reply_markup=ReplyKeyboardMarkup(menu_keyboard, resize_keyboard=True)
+    )
+
+def products(update: Update, context: CallbackContext):
+    products = "\n".join(db.get_products())
+    update.message.reply_text(f"منوی محصولات:\n{products}")
+
+def wallet(update: Update, context: CallbackContext):
+    balance = db.get_wallet(update.effective_user.id)
+    update.message.reply_text(f"موجودی کیف پول شما: {balance} تومان")
+
+def order(update: Update, context: CallbackContext):
+    update.message.reply_text("سفارش شما ثبت شد (دمو)")
+
+def help_command(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "راهنما:\n"
+        "نمایش منو /products\n"
+        "کیف پول /wallet\n"
+        "ثبت سفارش ساده /order"
+    )
