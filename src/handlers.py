@@ -278,8 +278,6 @@ async def delete_product_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # --- Handlers registry ---
 def register(app):
-    # پیش‌راه‌اندازی دیتابیس
-    app.job_queue.run_once(lambda *_: app.create_task(startup_warmup()), when=0)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
