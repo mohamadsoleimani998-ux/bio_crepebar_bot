@@ -1,3 +1,4 @@
+# src/bot.py
 from telegram.ext import Application, Defaults
 from telegram.constants import ParseMode
 from .base import TOKEN, PUBLIC_URL, WEBHOOK_SECRET, PORT, log
@@ -17,11 +18,8 @@ def main():
         app.add_handler(h)
 
     if PUBLIC_URL:
-        # مثال: https://bio-crepebar-bot.onrender.com/
         url = PUBLIC_URL.rstrip("/") + f"/{TOKEN}"
         log.info("Running webhook at %s", url)
-
-        # این متد بلاک‌کننده است و خودش init/start/idle/shutdown را انجام می‌دهد
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
