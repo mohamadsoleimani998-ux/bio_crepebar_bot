@@ -1,265 +1,237 @@
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
+from __future__ import annotations
+from typing import List, Tuple
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
 from telegram.ext import (
-    ContextTypes, CommandHandler, MessageHandler, ConversationHandler, filters
+    CommandHandler, MessageHandler, ConversationHandler,
+    ContextTypes, filters
 )
-from .base import ADMIN_IDS, CARD_NUMBER, CASHBACK_PERCENT, log
+from .base import log, ADMIN_IDS, CASHBACK_PERCENT, CARD_NUMBER
 from . import db
 
-# ── کیبوردها ─────────────────────────────────────────────────────────────────
+# ===== Keyboards (FA) =====
 MAIN_KB = ReplyKeyboardMarkup(
     [
         ["🍬 منو", "🧾 سفارش"],
-        ["👜 کیف پول", "🎮 بازی"],
+        ["👛 کیف پول", "🎮 بازی"],
         ["☎️ ارتباط با ما", "ℹ️ راهنما"],
-    ], resize_keyboard=True
+    ],
+    resize_keyboard=True
 )
 
-def admin_only(update: Update) -> bool:
-    return update.effective_user and (update.effective_user.id in ADMIN_IDS)
+WALLET_KB = ReplyKeyboardMarkup(
+    [
+        ["📥 شارژ کیف پول", "💳 موجودی"],
+        ["↩️ بازگشت"]
+    ],
+    resize_keyboard=True
+)
 
-# ────────────────────────────────────────────────────────────────────────────
+# ===== Helpers =====
+def _is_admin(uid: int) -> bool:
+    return uid in ADMIN_IDS
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    is_admin = admin_only(update)
-    db.upsert_user(u.id, u.full_name or u.username or str(u.id), is_admin=is_admin)
-
-    await update.message.reply_text(
+    db.upsert_user(u.id, u.full_name or u.username or str(u.id))
+    text = (
         "سلام! 👋 به ربات بایو کرپ‌بار خوش اومدی.\n"
         "از دکمه‌های زیر استفاده کن:\n"
         "• منو: نمایش محصولات با نام، قیمت و عکس\n"
         "• سفارش: ثبت سفارش و دریافت آدرس/شماره\n"
-        "• کیف پول: مشاهده/شارژ/کش‌بک %{} بعد هر خرید\n"
+        f"• کیف پول: مشاهده/شارژ، کش‌بک {CASHBACK_PERCENT}% بعد هر خرید\n"
         "• بازی: سرگرمی\n"
         "• ارتباط با ما: پیام به ادمین\n"
-        "• راهنما: دستورها".format(CASHBACK_PERCENT),
-        reply_markup=MAIN_KB
+        "• راهنما: دستورات"
     )
+    await update.message.reply_text(text, reply_markup=MAIN_KB)
 
-# ── راهنما/ارتباط ───────────────────────────────────────────────────────────
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "دستورها:\n"
-        "/start شروع\n"
-        "/register ثبت‌نام\n"
-        "/addproduct افزودن محصول (ادمین)\n"
-        "/menu منو\n"
-        "/wallet کیف پول\n"
+        "/start – شروع ربات\n"
+        "/addproduct – افزودن محصول (ادمین)\n"
+        "/register – ثبت نام/ویرایش مشخصات\n"
+        "/balance – موجودی کیف پول\n", reply_markup=MAIN_KB
     )
 
-async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("پیام خود را بنویسید؛ برای پاسخ، ادمین با شما تماس می‌گیرد.")
-
-# ── ثبت‌نام کاربر ───────────────────────────────────────────────────────────
+# ===== Register =====
 REG_NAME, REG_PHONE, REG_ADDR = range(3)
 
 async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("نام و نام‌خانوادگی را بفرست:")
+    await update.message.reply_text("نام کامل خود را بفرست:", reply_markup=ReplyKeyboardMarkup([["↩️ انصراف"]], resize_keyboard=True))
     return REG_NAME
 
 async def register_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text("شماره موبایل را بفرست (مثل 09xxxxxxxxx):")
+    await update.message.reply_text("📱 شماره تماس را بفرست (مثلاً 09xxxxxxxxx):")
     return REG_PHONE
 
 async def register_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["phone"] = update.message.text.strip()
-    await update.message.reply_text("آدرس کامل را بفرست:")
+    await update.message.reply_text("📍 آدرس را بفرست:")
     return REG_ADDR
 
 async def register_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["address"] = update.message.text.strip()
-    u = update.effective_user
-    db.update_profile(u.id, context.user_data["name"], context.user_data["phone"], context.user_data["address"])
-    await update.message.reply_text("ثبت‌نام با موفقیت انجام شد ✅", reply_markup=MAIN_KB)
+    name = context.user_data.get("name")
+    phone = context.user_data.get("phone")
+    address = update.message.text.strip()
+    db.update_user_profile(update.effective_user.id, name, phone, address)
+    await update.message.reply_text("✅ ثبت نام/ویرایش انجام شد.", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
 async def register_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ثبت‌نام لغو شد.", reply_markup=MAIN_KB)
+    await update.message.reply_text("لغو شد.", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
-# ── منو / محصولات ──────────────────────────────────────────────────────────
-async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== Menu / Products =====
+async def menu_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prods = db.list_products()
     if not prods:
-        msg = "فعلاً محصولی ثبت نشده."
-        if admin_only(update):
-            msg += "\nادمین: با /addproduct محصول اضافه کن."
-        await update.message.reply_text(msg)
+        await update.message.reply_text("فعلاً محصولی ثبت نشده.\nادمین: با /addproduct محصول اضافه کن.", reply_markup=MAIN_KB)
         return
-    for p in prods:
-        cap = f"• {p['name']}\nقیمت: {p['price']} تومان"
+    for p in prods[:30]:
+        caption = f"#{p['product_id']} • {p['name']}\n💰 {p['price']:,} تومان"
         if p.get("description"):
-            cap += f"\nتوضیح: {p['description']}"
+            caption += f"\n📝 {p['description']}"
         if p.get("photo_file_id"):
-            await update.message.reply_photo(p["photo_file_id"], caption=cap)
+            await update.message.reply_photo(p["photo_file_id"], caption=caption)
         else:
-            await update.message.reply_text(cap)
+            await update.message.reply_text(caption)
 
-# ── افزودن محصول (ادمین) ───────────────────────────────────────────────────
-ADD_NAME, ADD_PRICE, ADD_PHOTO, ADD_DESC = range(4)
+# ===== Wallet =====
+async def wallet_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("گزینهٔ کیف پول:", reply_markup=WALLET_KB)
 
-async def addproduct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not admin_only(update):
-        await update.message.reply_text("این بخش مخصوص ادمین است.")
+async def wallet_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bal = db.wallet_balance(update.effective_user.id)
+    await update.message.reply_text(f"💳 موجودی شما: {bal:,} تومان", reply_markup=WALLET_KB)
+
+async def wallet_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        f"برای شارژ کیف پول، مبلغ را کارت‌به‌کارت کنید:\n"
+        f"💳 شماره کارت: <code>{CARD_NUMBER}</code>\n"
+        "سپس رسید یا 4 رقم آخر کارت و مبلغ را برای ادمین ارسال کنید.\n"
+        "ادمین با دستور زیر شارژ می‌کند:\n"
+        "<code>/confirm USER_ID AMOUNT</code>\n"
+        "مثال: <code>/confirm 1606170079 500000</code>"
+    )
+    await update.message.reply_text(msg, reply_markup=WALLET_KB)
+
+# ادمین: تایید شارژ
+async def admin_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not _is_admin(uid):
+        return
+    try:
+        _, user_id_str, amount_str = update.message.text.strip().split(maxsplit=2)
+        user_id = int(user_id_str)
+        amount = int(amount_str)
+    except Exception:
+        await update.message.reply_text("فرمت صحیح: /confirm <USER_ID> <AMOUNT>")
+        return
+    db.wallet_add(user_id, amount, kind="topup", meta={"by": uid})
+    await update.message.reply_text(f"✅ برای {user_id} مبلغ {amount:,} تومان شارژ شد.")
+
+# ===== Add Product (admin) =====
+P_NAME, P_PRICE, P_PHOTO, P_DESC = range(4)
+
+async def addp_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update.effective_user.id):
+        await update.message.reply_text("این دستور مخصوص ادمین است.")
         return ConversationHandler.END
     await update.message.reply_text("نام محصول را بفرست:")
-    return ADD_NAME
+    return P_NAME
 
-async def addproduct_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["p_name"] = (update.message.text or "").strip()
+async def addp_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["p_name"] = update.message.text.strip()
     await update.message.reply_text("قیمت (تومان) را بفرست:")
-    return ADD_PRICE
+    return P_PRICE
 
-async def addproduct_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = (update.message.text or "").replace(",", "").strip()
-    if not t.isdigit():
-        await update.message.reply_text("قیمت صحیح نیست. یک عدد بفرست.")
-        return ADD_PRICE
-    context.user_data["p_price"] = int(t)
+async def addp_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        price = int(update.message.text.replace(",", "").strip())
+    except Exception:
+        await update.message.reply_text("قیمت نامعتبر. یک عدد بفرست.")
+        return P_PRICE
+    context.user_data["p_price"] = price
     await update.message.reply_text("عکس محصول را بفرست (یا بنویس «بدون عکس»):")
-    return ADD_PHOTO
+    return P_PHOTO
 
-async def addproduct_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def addp_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.photo:
-        fid = update.message.photo[-1].file_id
-        context.user_data["p_photo"] = fid
+        file_id = update.message.photo[-1].file_id
     else:
-        if (update.message.text or "").strip() != "بدون عکس":
-            await update.message.reply_text("لطفاً عکس بفرست یا بنویس «بدون عکس».")
-            return ADD_PHOTO
-        context.user_data["p_photo"] = None
-    await update.message.reply_text("توضیح کوتاه محصول (اختیاری) را بفرست؛ یا بنویس «بدون توضیح».")
-    return ADD_DESC
+        text = (update.message.text or "").strip()
+        file_id = None if "بدون" in text else None
+    context.user_data["p_photo"] = file_id
+    await update.message.reply_text("توضیحات کوتاه (اختیاری) را بفرست. اگر نمی‌خواهی بنویس «بدون توضیحات».")
+    return P_DESC
 
-async def addproduct_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    desc = (update.message.text or "").strip()
-    if desc == "بدون توضیح":
-        desc = ""
-    p = db.add_product(context.user_data["p_name"], context.user_data["p_price"],
-                       context.user_data.get("p_photo"), desc)
-    await update.message.reply_text(f"ثبت شد ✅\n#{p['id']} - {p['name']} ({p['price']} تومان)")
+async def addp_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    desc = None if "بدون" in text else text
+    p = db.add_product(
+        context.user_data.get("p_name"),
+        context.user_data.get("p_price"),
+        context.user_data.get("p_photo"),
+        desc
+    )
+    await update.message.reply_text(f"✅ محصول ثبت شد: #{p['product_id']} – {p['name']} ({p['price']:,} تومان)", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
-async def addproduct_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("افزودن محصول لغو شد.")
+async def addp_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("لغو شد.", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
-# ── کیف پول ─────────────────────────────────────────────────────────────────
-WALLET_MENU, WALLET_CHARGE = range(2)
+# ===== Fallbacks / small handlers =====
+async def contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("☎️ پیام بده: @your_admin_username", reply_markup=MAIN_KB)
 
-async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bal = db.wallet_balance(update.effective_user.id)
-    kb = ReplyKeyboardMarkup(
-        [["➕ شارژ کیف پول", "📜 گردش‌ها"], ["بازگشت ⬅️"]],
-        resize_keyboard=True
-    )
-    await update.message.reply_text(
-        f"موجودی کیف پول: {bal} تومان\n"
-        f"کش‌بک فعال: {CASHBACK_PERCENT}%",
-        reply_markup=kb
-    )
-    return WALLET_MENU
+async def game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎮 به‌زودی بازی‌های کوچک اضافه می‌شود.", reply_markup=MAIN_KB)
 
-async def wallet_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if txt == "➕ شارژ کیف پول":
-        await update.message.reply_text(
-            "مبلغ شارژ (تومان) را بفرست.\n"
-            f"پرداخت کارت‌به‌کارت به کارت: {CARD_NUMBER}\n"
-            "سپس «پرداخت شد» را ارسال کن."
-        )
-        return WALLET_CHARGE
-    elif txt == "📜 گردش‌ها":
-        await update.message.reply_text("جهت سادگی نسخه فعلی، گزارش‌گیری خلاصه است. (به‌زودی کامل‌تر)")
-        return WALLET_MENU
-    else:
-        await update.message.reply_text("بازگشت به منو.", reply_markup=MAIN_KB)
-        return ConversationHandler.END
-
-async def wallet_charge(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    t = (update.message.text or "").replace(",", "").strip()
-    if t == "پرداخت شد":
-        amt = context.user_data.get("charge_amount")
-        if not amt:
-            await update.message.reply_text("ابتدا مبلغ را وارد کن.")
-            return WALLET_CHARGE
-        # در نسخه فعلی، تأیید خودکار (نسخه بعدی: تأیید ادمین)
-        db.wallet_change(update.effective_user.id, amt, "charge", "manual card to card")
-        await update.message.reply_text(f"شارژ شد ✅ (+{amt})", reply_markup=MAIN_KB)
-        return ConversationHandler.END
-    if not t.isdigit():
-        await update.message.reply_text("لطفاً یک عدد بفرست یا پیام «پرداخت شد».")
-        return WALLET_CHARGE
-    context.user_data["charge_amount"] = int(t)
-    await update.message.reply_text(
-        f"عدد {t} ثبت شد.\n"
-        f"حالا کارت‌به‌کارت به {CARD_NUMBER} انجام بده و «پرداخت شد» رو بفرست.")
-    return WALLET_CHARGE
-
-# ── روتر متن‌های عمومی ─────────────────────────────────────────────────────
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if txt in ("منو", "🍬 منو"):
-        return await menu_cmd(update, context)
-    if txt in ("کیف پول", "👜 کیف پول"):
-        return await wallet_cmd(update, context)
-    if txt in ("ارتباط با ما", "☎️ ارتباط با ما"):
-        return await contact(update, context)
-    if txt in ("راهنما", "ℹ️ راهنما"):
-        return await help_cmd(update, context)
-    if txt in ("سفارش", "🧾 سفارش"):
-        return await update.message.reply_text("ماژول سفارش در نسخه بعدی تکمیل می‌شود. فعلاً از منو خرید کنید 😊")
-    # fallback
-    await update.message.reply_text("از دکمه‌ها استفاده کن.", reply_markup=MAIN_KB)
-
-# ── رجیستر همه هندلرها ─────────────────────────────────────────────────────
-def build_handlers():
-    hs = []
-
-    hs.append(CommandHandler("start", start))
-    hs.append(CommandHandler("help", help_cmd))
-    hs.append(CommandHandler("menu", menu_cmd))
-    hs.append(CommandHandler("wallet", wallet_cmd))
-    hs.append(CommandHandler("register", register_start))
-    hs.append(CommandHandler("addproduct", addproduct_start))
-
-    # ثبت‌نام
-    hs.append(ConversationHandler(
+def build_handlers() -> List:
+    reg = ConversationHandler(
         entry_points=[CommandHandler("register", register_start)],
         states={
-            REG_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, register_name)],
-            REG_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, register_phone)],
-            REG_ADDR:  [MessageHandler(filters.TEXT & ~filters.COMMAND, register_addr)],
+            REG_NAME: [MessageHandler(filters.TEXT & ~filters.Regex("^↩️ انصراف$"), register_name)],
+            REG_PHONE:[MessageHandler(filters.TEXT & ~filters.Regex("^↩️ انصراف$"), register_phone)],
+            REG_ADDR: [MessageHandler(filters.TEXT & ~filters.Regex("^↩️ انصراف$"), register_addr)],
         },
-        fallbacks=[MessageHandler(filters.Regex("^لغو$"), register_cancel)],
-        allow_reentry=True,
-    ))
+        fallbacks=[MessageHandler(filters.Regex("^↩️ انصراف$"), register_cancel)],
+        name="register",
+        persistent=False
+    )
 
-    # افزودن محصول
-    hs.append(ConversationHandler(
-        entry_points=[CommandHandler("addproduct", addproduct_start)],
+    addp = ConversationHandler(
+        entry_points=[CommandHandler("addproduct", addp_start), MessageHandler(filters.Regex("^/addproduct$"), addp_start)],
         states={
-            ADD_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, addproduct_name)],
-            ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addproduct_price)],
-            ADD_PHOTO: [MessageHandler((filters.PHOTO | filters.TEXT) & ~filters.COMMAND, addproduct_photo)],
-            ADD_DESC:  [MessageHandler(filters.TEXT & ~filters.COMMAND, addproduct_desc)],
+            P_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, addp_name)],
+            P_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, addp_price)],
+            P_PHOTO: [MessageHandler((filters.PHOTO | filters.Regex("بدون")), addp_photo)],
+            P_DESC:  [MessageHandler(filters.TEXT & ~filters.COMMAND, addp_desc)],
         },
-        fallbacks=[MessageHandler(filters.Regex("^لغو$"), addproduct_cancel)],
-        allow_reentry=True,
-    ))
+        fallbacks=[CommandHandler("cancel", addp_cancel)],
+        name="addproduct",
+        persistent=False
+    )
 
-    # کیف پول
-    hs.append(ConversationHandler(
-        entry_points=[CommandHandler("wallet", wallet_cmd)],
-        states={
-            WALLET_MENU:  [MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_menu_router)],
-            WALLET_CHARGE:[MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_charge)],
-        },
-        fallbacks=[MessageHandler(filters.Regex("^لغو$"), text_router)],
-        allow_reentry=True,
-    ))
-
-    # روتر عمومی متن‌ها
-    hs.append(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
-
-    return hs
+    return [
+        CommandHandler("start", start),
+        CommandHandler("help", help_cmd),
+        CommandHandler("register", register_start),
+        CommandHandler("balance", wallet_balance_cmd),
+        CommandHandler("confirm", admin_confirm),  # admin only
+        addp, reg,
+        # Persian buttons
+        MessageHandler(filters.Regex("^🍬 منو$"), menu_show),
+        MessageHandler(filters.Regex("^🧾 سفارش$"), help_cmd),  # نمونه ساده
+        MessageHandler(filters.Regex("^👛 کیف پول$"), wallet_entry),
+        MessageHandler(filters.Regex("^📥 شارژ کیف پول$"), wallet_topup),
+        MessageHandler(filters.Regex("^💳 موجودی$"), wallet_balance_cmd),
+        MessageHandler(filters.Regex("^↩️ بازگشت$"), start),
+        MessageHandler(filters.Regex("^☎️ ارتباط با ما$"), contact),
+        MessageHandler(filters.Regex("^🎮 بازی$"), game),
+        MessageHandler(filters.Regex("^ℹ️ راهنما$"), help_cmd),
+        # آخرین راه‌حل: هر متن ناشناخته -> منو
+        MessageHandler(filters.TEXT & ~filters.COMMAND, start),
+    ]
