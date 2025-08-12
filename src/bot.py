@@ -1,14 +1,14 @@
-import asyncio
 from telegram.ext import Application, Defaults
 from telegram.constants import ParseMode
 from .base import TOKEN, PUBLIC_URL, WEBHOOK_SECRET, PORT, log
 from .handlers import build_handlers
 from . import db
 
-async def main():
+def main():
     if not TOKEN:
         raise RuntimeError("TOKEN env is missing (TELEGRAM_TOKEN / BOT_TOKEN).")
 
+    # ساخت جداول در صورت نبودن
     db.init_db()
 
     app = Application.builder().token(TOKEN).defaults(Defaults(parse_mode=ParseMode.HTML)).build()
@@ -16,22 +16,23 @@ async def main():
     for h in build_handlers():
         app.add_handler(h)
 
-    # Webhook (Render)
     if PUBLIC_URL:
-        # نمونه: https://bio-crepebar-bot.onrender.com/
+        # مثال: https://bio-crepebar-bot.onrender.com/
         url = PUBLIC_URL.rstrip("/") + f"/{TOKEN}"
-        log.info("Setting webhook to %s", url)
-        await app.bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
-        await app.run_webhook(
+        log.info("Running webhook at %s", url)
+
+        # این متد بلاک‌کننده است و خودش init/start/idle/shutdown را انجام می‌دهد
+        app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
             url_path=TOKEN,
+            webhook_url=url,
             secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
         )
     else:
-        # fallback polling (برای توسعه)
         log.warning("PUBLIC_URL not set -> running polling")
-        await app.run_polling(drop_pending_updates=True)
+        app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
