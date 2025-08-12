@@ -1,48 +1,37 @@
-# src/bot.py
-import os
-import logging
+import asyncio
+from telegram.ext import Application, Defaults
+from telegram.constants import ParseMode
+from .base import TOKEN, PUBLIC_URL, WEBHOOK_SECRET, PORT, log
+from .handlers import build_handlers
+from . import db
 
-from telegram.ext import Application
-
-# نکته مهم: ایمپورت داخل پکیج src
-from src.handlers import register
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
-)
-log = logging.getLogger("bot")
-
-TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE") or os.getenv("PUBLIC_URL")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL") or WEBHOOK_BASE
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
-
-PORT = int(os.getenv("PORT", "10000"))  # Render PORT
-
-def main() -> None:
+async def main():
     if not TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN not set!")
+        raise RuntimeError("TOKEN env is missing (TELEGRAM_TOKEN / BOT_TOKEN).")
 
-    application = Application.builder().token(TOKEN).build()
+    db.init_db()
 
-    # همه هندلرها (از جمله /start) اینجا رجیستر می‌شوند
-    register(application)
+    app = Application.builder().token(TOKEN).defaults(Defaults(parse_mode=ParseMode.HTML)).build()
 
-    # اگر آدرس وبهوک داری => وبهوک، وگرنه polling
-    if WEBHOOK_URL:
-        # PTB v20.6: run_webhook پارامتر on_startup ندارد
-        log.info("Starting webhook on port %s ...", PORT)
-        application.run_webhook(
+    for h in build_handlers():
+        app.add_handler(h)
+
+    # Webhook (Render)
+    if PUBLIC_URL:
+        # نمونه: https://bio-crepebar-bot.onrender.com/
+        url = PUBLIC_URL.rstrip("/") + f"/{TOKEN}"
+        log.info("Setting webhook to %s", url)
+        await app.bot.set_webhook(url=url, secret_token=WEBHOOK_SECRET, drop_pending_updates=True)
+        await app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            webhook_url=WEBHOOK_URL,
+            url_path=TOKEN,
             secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True,
         )
     else:
-        log.info("WEBHOOK_URL not set -> falling back to polling")
-        application.run_polling(drop_pending_updates=True)
+        # fallback polling (برای توسعه)
+        log.warning("PUBLIC_URL not set -> running polling")
+        await app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
