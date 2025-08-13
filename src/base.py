@@ -1,26 +1,27 @@
 import logging
 import os
-from telegram.constants import ParseMode
-from telegram.ext import Defaults
 
-# ---------- Logging ----------
+from dotenv import load_dotenv
+load_dotenv()
+
+# ---------- Log ----------
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=os.environ.get("LOG_LEVEL", "INFO"),
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | crepebar | %(message)s"
 )
 log = logging.getLogger("crepebar")
 
 # ---------- ENV ----------
-BOT_TOKEN       = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-PUBLIC_URL      = os.environ.get("PUBLIC_URL") or os.environ.get("WEBHOOK_URL")
-WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "telegram-secret")
-ADMIN_IDS       = {int(x) for x in (os.environ.get("ADMIN_IDS") or "").replace(",", " ").split() if x.isdigit()}
-CASHBACK_PERCENT = int(os.environ.get("CASHBACK_PERCENT", "3"))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/") + "/"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
+CASHBACK_PERCENT = float(os.environ.get("CASHBACK_PERCENT", "3") or 3)
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN env is missing")
-if not PUBLIC_URL:
-    raise RuntimeError("PUBLIC_URL env (your Render URL) is missing")
+_admin_raw = os.environ.get("ADMIN_IDS", "")
+ADMIN_IDS = {int(x) for x in _admin_raw.replace(",", " ").split() if x.isdigit()}
 
-# Defaults: همه پیام‌ها HTML
-tg_defaults = Defaults(parse_mode=ParseMode.HTML)
+CURRENCY = "تومان"
+
+def is_admin(tg_id: int) -> bool:
+    return tg_id in ADMIN_IDS
