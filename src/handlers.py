@@ -1,348 +1,229 @@
-from __future__ import annotations
-from decimal import Decimal
-import re
 from telegram import (
-    Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton,
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup, InputMediaPhoto
 )
 from telegram.ext import (
-    ContextTypes, CommandHandler, MessageHandler, ConversationHandler, filters
+    ContextTypes, CommandHandler, MessageHandler, ConversationHandler, CallbackQueryHandler, filters
 )
-from .base import ADMIN_IDS, DEFAULT_CASHBACK, log
+from .base import *
 from . import db
 
-# ---------- Keyboards (FA)
-MAIN_KB = ReplyKeyboardMarkup(
-    [
-        ["منو 🍬", "سفارش 🧾"],
-        ["کیف پول 👛", "بازی 🎮"],
-        ["ارتباط با ما ☎️", "راهنما ℹ️"],
-        ["ثبت نام 📝"],
-    ],
-    resize_keyboard=True,
+# ====== کمک‌متن‌ها ======
+WELCOME = (
+    "سلام! 👋 به ربات بایو کرپ‌بار خوش‌اومدی.\n"
+    "از دکمه‌های زیر استفاده کن:\n"
+    f"• {BTN_MENU}: نمایش محصولات با نام/قیمت/عکس\n"
+    f"• {BTN_ORDER}: ثبت سفارش ساده\n"
+    f"• {BTN_WALLET}: مشاهده/شارژ، کش‌بک {DEFAULT_CASHBACK_PERCENT}% بعد هر خرید\n"
+    f"• {BTN_GAME}: سرگرمی\n"
+    f"• {BTN_CONTACT}: پیام به ادمین\n"
+    f"• {BTN_HELP}: دستورها\n"
 )
 
-def money(n) -> str:
-    try:
-        n = int(Decimal(n))
-    except Exception:
-        pass
-    return f"{n:,} تومان".replace(",", "٬")
+MAIN_KB = ReplyKeyboardMarkup(
+    [[BTN_MENU, BTN_ORDER],[BTN_WALLET, BTN_GAME],[BTN_CONTACT, BTN_HELP]],
+    resize_keyboard=True
+)
 
-# ---------- /start & welcome
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== ثبت‌نام سریع در /start =====
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
-    row = db.upsert_user(u.id, u.full_name)
-    text = (
-        "سلام! 👋 به ربات بایو کِرِپ‌بار خوش اومدی.\n"
-        "از دکمه‌های زیر استفاده کن:\n"
-        "• منو: نمایش محصولات با نام، قیمت و عکس\n"
-        "• سفارش: ثبت سفارش و دریافت آدرس/شماره\n"
-        f"• کیف پول: مشاهده/شارژ، کش‌بک {db.get_cashback_percent() or DEFAULT_CASHBACK}% بعد هر خرید\n"
-        "• ثبت نام: تکمیل نام، شماره و آدرس\n"
-        "• بازی: سرگرمی\n"
-        "• ارتباط با ما: پیام به ادمین\n"
-        "• راهنما: دستورها"
-    )
-    await update.effective_message.reply_text(text, reply_markup=MAIN_KB)
+    db.upsert_user(u.id, (u.full_name or u.username or ""))
+    await update.message.reply_text(WELCOME, reply_markup=MAIN_KB)
 
-# ---------- Menu (list products)
-async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    prods = db.list_products(limit=10)
+# ===== منو =====
+async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    prods = db.list_products()
     if not prods:
-        await update.effective_message.reply_text("فعلاً محصولی ثبت نشده.\nادمین: با /addproduct محصول اضافه کن.")
+        await update.effective_message.reply_text("هنوز محصولی ثبت نشده.")
         return
-    for p in prods:
-        caption = f"• {p['name']}\nقیمت: {money(p['price'])}"
-        if p.get("description"):
-            caption += f"\n{p['description']}"
-        if p.get("photo_file_id"):
-            await update.effective_message.reply_photo(p["photo_file_id"], caption=caption)
-        else:
-            await update.effective_message.reply_text(caption)
+    # عکس‌دار جداگانه، بقیه با متن
+    medias = []
+    for p in prods[:10]:
+        cap = f"🍰 <b>{p['name']}</b>\n💵 {int(p['price'])} تومان\n" + (p["description"] or "")
+        if p["photo_file_id"]:
+            medias.append(("photo", p["photo_file_id"], cap))
+    if medias:
+        # ارسال اولین به صورت عکس، بقیه آلبوم
+        first = medias[0]
+        await update.effective_message.reply_photo(first[1], caption=first[2], reply_markup=MAIN_KB)
+        for kind, fid, cap in medias[1:]:
+            await update.effective_chat.send_photo(fid, caption=cap)
+    # لیست متنی هم بده
+    lines = [f"{i+1}. {p['name']} — {int(p['price'])} تومان" for i,p in enumerate(prods)]
+    await update.effective_message.reply_text("📋 منو:\n" + "\n".join(lines))
 
-# ---------- Wallet
-async def wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = db.get_user_by_tg(update.effective_user.id)
-    percent = db.get_cashback_percent() or DEFAULT_CASHBACK
-    kb = ReplyKeyboardMarkup(
-        [[KeyboardButton("شارژ کارت‌به‌کارت")], ["بازگشت ⬅️"]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
+# ===== کیف پول =====
+async def wallet_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    bal = db.wallet(update.effective_user.id)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(BTN_WALLET_TOPUP, callback_data="topup")]])
     await update.effective_message.reply_text(
-        f"موجودی شما: {money(u['balance'])}\nکش‌بک فعال: {percent}%",
-        reply_markup=kb,
+        f"💳 موجودی شما: <b>{int(bal)}</b> تومان\nکش‌بک فعال: {DEFAULT_CASHBACK_PERCENT}%",
+        reply_markup=kb
     )
 
-async def wallet_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.effective_message.text or "").strip()
-    if txt == "شارژ کارت‌به‌کارت":
-        await update.effective_message.reply_text(
-            "مبلغ شارژ را به کارت زیر واریز کن و رسید را برای ادمین بفرست:\n"
-            "شماره کارت: 5029-0810-8098-4145\n\n"
-            "پس از تأیید ادمین، موجودی‌ات افزایش می‌یابد."
+async def wallet_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "topup":
+        card = CARD_NUMBER
+        await q.edit_message_text(
+            f"برای شارژ کارت‌به‌کارت 👇\n"
+            f"شماره کارت: <code>{card}</code>\n"
+            "مبلغ دلخواه رو واریز کن و رسید را به صورت «متن» به شکل زیر ارسال کن:\n"
+            "مثال: <code>شارژ 150000 با کدپیگیری 123456</code>"
         )
-    elif txt == "بازگشت ⬅️":
-        await update.effective_message.reply_text("بازگشت به منو.", reply_markup=MAIN_KB)
 
-# ---------- Simple order (demo): "نام ×تعداد"
-async def order_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "نام محصول و تعداد را بنویس (مثال: «اسپرسو ×2».)\n(دموی ساده)"
-    )
+async def wallet_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text or ""
+    if txt.startswith("شارژ"):
+        # الگوی ساده
+        import re
+        m = re.search(r"شارژ\s+(\d+).*?(\d+)", txt)
+        if not m:
+            await update.message.reply_text("فرمت نامعتبر. نمونه: «شارژ 150000 با کدپیگیری 123456»")
+            return
+        amount = int(m.group(1)); ref = m.group(2)
+        db.topup_wallet(update.effective_user.id, amount, ref)
+        await update.message.reply_text(f"✅ شارژ شد: {amount} تومان (رسید: {ref})")
 
-def _parse_name_qty(s: str):
-    s = s.replace("×", "x").replace("X", "x").strip()
-    if "x" in s:
-        name, qty = s.split("x", 1)
-        try:
-            q = int(qty.strip())
-        except Exception:
-            q = 1
-        return name.strip(), max(q, 1)
-    return s.strip(), 1
+# ===== سفارش ساده (نام محصول × تعداد) =====
+async def order_entry(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("نام محصول و تعداد را بنویس (مثال: «اسپرسو ×2»).")
 
-async def order_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name, qty = _parse_name_qty(update.effective_message.text or "")
-    prod = db.find_product_by_name(name)
-    if not prod:
-        await update.effective_message.reply_text("محصول پیدا نشد. اول با «منو 🍬» لیست را ببین.")
+async def order_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txt = (update.message.text or "").replace("x","×").replace("X","×")
+    if "×" not in txt:
+        await update.message.reply_text("الگو نامعتبر. مثال: «لاته ×1».")
         return
-    u = db.upsert_user(update.effective_user.id, update.effective_user.full_name)
-    order_id = db.create_order(u["user_id"])
-    db.add_item(order_id, prod["product_id"], qty, float(prod["price"]))
+    name, qty = [x.strip() for x in txt.split("×",1)]
+    qty = int(qty or "1")
+    # پیدا کردن محصول
+    prods = db.list_products()
+    prod = next((p for p in prods if p["name"].strip()==name), None)
+    if not prod:
+        await update.message.reply_text("محصول پیدا نشد.")
+        return
+    u = db.get_user(update.effective_user.id)
+    order_id = db.open_draft_order(u["id"])
+    db.add_item(order_id, prod["id"], qty, float(prod["price"]))
     db.submit_order(order_id)
+    await update.message.reply_text(f"✅ سفارش ثبت شد: {name} ×{qty}")
 
-    msg = (
-        f"سفارش #{order_id}\n"
-        f"{prod['name']} × {qty}\n"
-        f"مبلغ کل: {money(Decimal(prod['price']) * qty)}\n\n"
-        "برای پرداخت کارت‌به‌کارت:\n"
-        "5029-0810-8098-4145\n"
-        "پس از پرداخت، ادمین با دستور /paid <order_id> تأیید می‌کند."
-    )
-    await update.effective_message.reply_text(msg)
+# ===== ثبت‌نام/پروفایل =====
+PROFILE_NAME, PROFILE_PHONE, PROFILE_ADDRESS = range(3)
 
-# ---------- Admin helpers
+async def register(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("اسم‌ت رو بفرست:")
+    return PROFILE_NAME
+
+async def profile_name(update, ctx):
+    ctx.user_data["name"] = update.message.text.strip()
+    await update.message.reply_text("شماره موبایل:")
+    return PROFILE_PHONE
+
+async def profile_phone(update, ctx):
+    ctx.user_data["phone"] = update.message.text.strip()
+    await update.message.reply_text("آدرس:")
+    return PROFILE_ADDRESS
+
+async def profile_address(update, ctx):
+    ctx.user_data["address"] = update.message.text.strip()
+    db.set_user_profile(update.effective_user.id, **ctx.user_data)
+    await update.message.reply_text("✅ ثبت شد.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+
+async def cancel_conv(update, ctx):
+    await update.message.reply_text("لغو شد.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+
+# ===== ادمین: افزودن محصول =====
+ADD_NAME, ADD_PRICE, ADD_PHOTO, ADD_DESC = range(10,14)
+
 def _is_admin(update: Update) -> bool:
-    uid = update.effective_user.id if update.effective_user else 0
-    return uid in ADMIN_IDS
+    return update.effective_user and update.effective_user.id in ADMIN_IDS
 
-# ----- Add Product (admin)
-AP_NAME, AP_PRICE, AP_PHOTO, AP_DESC = range(4)
-
-async def addproduct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_add(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
-        return await update.effective_message.reply_text("دسترسی نداری.")
-    context.user_data.clear()
-    await update.effective_message.reply_text("نام محصول را بفرست:")
-    return AP_NAME
+        await update.message.reply_text("اجازه نداری.")
+        return ConversationHandler.END
+    await update.message.reply_text("نام محصول را بفرست:")
+    return ADD_NAME
 
-async def ap_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = (update.effective_message.text or "").strip()
-    await update.effective_message.reply_text("قیمت (تومان) را بفرست:")
-    return AP_PRICE
+async def add_name(update, ctx):
+    ctx.user_data["p_name"] = update.message.text.strip()
+    await update.message.reply_text("قیمت (تومان):")
+    return ADD_PRICE
 
-async def ap_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.effective_message.text or "").replace(",", "").strip()
-    try:
-        price = float(txt)
-    except Exception:
-        await update.effective_message.reply_text("قیمت نامعتبر است. یک عدد بفرست.")
-        return AP_PRICE
-    context.user_data["price"] = price
-    await update.effective_message.reply_text("عکس محصول را بفرست (یا بنویس «بدون عکس»):")
-    return AP_PHOTO
+async def add_price(update, ctx):
+    ctx.user_data["p_price"] = float(update.message.text.strip())
+    await update.message.reply_text("عکس محصول را بفرست (یا بنویس «بدون عکس»):")
+    return ADD_PHOTO
 
-async def ap_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_photo(update, ctx):
     if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        context.user_data["photo_id"] = file_id
+        fid = update.message.photo[-1].file_id
     else:
-        context.user_data["photo_id"] = None
-    await update.effective_message.reply_text("توضیحات کوتاه (اختیاری) را بفرست. اگر نمی‌خواهی بنویس «بدون توضیحات».")
-    return AP_DESC
+        fid = None
+    ctx.user_data["p_photo"] = fid
+    await update.message.reply_text("توضیحات کوتاه (اختیاری). اگر نمی‌خوای بنویس «بدون توضیحات».")
+    return ADD_DESC
 
-async def ap_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    desc = (update.effective_message.text or "").strip()
-    if desc in ("بدون توضیحات", "بدون توضیح", "بدون"):
+async def add_desc(update, ctx):
+    desc = update.message.text
+    if desc in ("بدون توضیحات","بدون توضیح"):
         desc = None
-    pid = db.add_product(
-        context.user_data["name"],
-        context.user_data["price"],
-        context.user_data.get("photo_id"),
-        desc,
-    )
-    await update.effective_message.reply_text(f"محصول با شناسه #{pid} ذخیره شد ✅", reply_markup=MAIN_KB)
-    return ConversationHandler.END
-
-async def ap_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("لغو شد.", reply_markup=MAIN_KB)
-    return ConversationHandler.END
-
-# ----- Admin commands
-async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        return await update.effective_message.reply_text("دسترسی نداری.")
-    if not context.args:
-        return await update.effective_message.reply_text("مثال: /paid 123")
     try:
-        order_id = int(context.args[0])
-    except Exception:
-        return await update.effective_message.reply_text("شناسه سفارش نامعتبر است.")
-    row = db.mark_paid(order_id)
-    if not row:
-        return await update.effective_message.reply_text("سفارش پیدا نشد.")
-    await update.effective_message.reply_text(
-        f"سفارش #{order_id} paid شد. مبلغ: {money(row[1])} | کش‌بک: {money(row[2])}"
-    )
-
-async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        return await update.effective_message.reply_text("دسترسی نداری.")
-    if len(context.args) < 2:
-        return await update.effective_message.reply_text("مثال: /topup 1606170079 50000")
-    tg_id = int(context.args[0])
-    amount = float(context.args[1])
-    u = db.get_user_by_tg(tg_id)
-    if not u:
-        return await update.effective_message.reply_text("کاربر یافت نشد.")
-    db.topup(u["user_id"], amount, {"method": "card2card", "card": "5029081080984145"})
-    bal = db.get_balance(u["user_id"])
-    await update.effective_message.reply_text(f"شارژ انجام شد. موجودی جدید: {money(bal)}")
-
-async def setcashback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not _is_admin(update):
-        return await update.effective_message.reply_text("دسترسی نداری.")
-    if not context.args:
-        return await update.effective_message.reply_text("مثال: /setcashback 3")
-    p = int(context.args[0])
-    db.set_cashback_percent(p)
-    await update.effective_message.reply_text(f"درصد کش‌بک روی {p}% تنظیم شد.")
-
-# ----- Help
-async def help_cmd(update, context):
-    await update.effective_message.reply_text(
-        "دستورها:\n"
-        "/start – شروع\n"
-        "/register – ثبت‌نام (نام/شماره/آدرس)\n"
-        "/addproduct – افزودن محصول (ادمین)\n"
-        "/paid <order_id> – تأیید پرداخت (ادمین)\n"
-        "/topup <tg_id> <amount> – شارژ کیف پول (ادمین)\n"
-        "/setcashback <p> – تعیین درصد کش‌بک (ادمین)\n"
-    )
-
-# ===================== Registration Conversation =====================
-REG_NAME, REG_PHONE, REG_ADDR = range(3)
-PHONE_RE = re.compile(r"^(?:\+?98|0)?9\d{9}$")  # موبایل ایران
-
-async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ایجاد/به‌روزرسانی اولیه نام تلگرام
-    db.upsert_user(update.effective_user.id, update.effective_user.full_name)
-    await update.effective_message.reply_text(
-        "ثبت‌نام شروع شد. نامت را بفرست (یا همان نام روی پروفایل را تأیید کن):"
-    )
-    return REG_NAME
-
-async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["name"] = (update.effective_message.text or "").strip()
-    kb = ReplyKeyboardMarkup(
-        [[KeyboardButton("ارسال مخاطب من", request_contact=True)], ["لغو"]],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-    )
-    await update.effective_message.reply_text(
-        "شماره موبایل را بفرست (با 09 یا +989 شروع شود) یا دکمه «ارسال مخاطب من» را بزن.",
-        reply_markup=kb,
-    )
-    return REG_PHONE
-
-async def reg_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = None
-    if update.message.contact and update.message.contact.phone_number:
-        phone = update.message.contact.phone_number
-    else:
-        phone = (update.effective_message.text or "").replace(" ", "")
-    # نرمال‌سازی ساده
-    phone = phone.replace("+98", "0") if phone.startswith("+98") else phone
-    if not PHONE_RE.match(phone):
-        await update.effective_message.reply_text("شماره نامعتبر است. دوباره بفرست یا «لغو».")
-        return REG_PHONE
-    context.user_data["phone"] = phone
-    await update.effective_message.reply_text(
-        "آدرس دقیق را بفرست (خیابان/کوچه/پلاک).",
-        reply_markup=ReplyKeyboardMarkup([["لغو"]], resize_keyboard=True, one_time_keyboard=True),
-    )
-    return REG_ADDR
-
-async def reg_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    addr = (update.effective_message.text or "").strip()
-    u = db.get_user_by_tg(update.effective_user.id)
-    db.update_profile(u["user_id"], name=context.user_data.get("name"), phone=context.user_data.get("phone"), address=addr)
-    await update.effective_message.reply_text("✅ ثبت‌نام تکمیل شد.", reply_markup=MAIN_KB)
+        db.add_product(ctx.user_data["p_name"], ctx.user_data["p_price"], ctx.user_data["p_photo"], desc)
+        await update.message.reply_text("✅ ذخیره شد.", reply_markup=MAIN_KB)
+    except Exception as e:
+        log.exception("add_product failed")
+        await update.message.reply_text(f"❌ خطا در ذخیره: {e}", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
-async def reg_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("لغو شد.", reply_markup=MAIN_KB)
-    return ConversationHandler.END
-# =====================================================================
+# ===== راهنما =====
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "/start — شروع\n/register — ثبت نام\n/add — افزودن محصول (ادمین)\n"
+        "دکمه‌های پایین همۀ امکانات را دارند."
+    )
 
-# ---------- Router
 def build_handlers():
-    addprod_conv = ConversationHandler(
-        entry_points=[CommandHandler("addproduct", addproduct_start)],
-        states={
-            AP_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, ap_name)],
-            AP_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ap_price)],
-            AP_PHOTO: [MessageHandler((filters.PHOTO | filters.Regex("^بدون عکس$")) & ~filters.COMMAND, ap_photo)],
-            AP_DESC:  [MessageHandler(filters.TEXT & ~filters.COMMAND, ap_desc)],
-        },
-        fallbacks=[CommandHandler("cancel", ap_cancel)],
-        name="addproduct",
-        persistent=False,
-    )
-
-    register_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("register", register_start),
-            MessageHandler(filters.Regex("^ثبت نام 📝$"), register_start),
-        ],
-        states={
-            REG_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)],
-            REG_PHONE: [
-                MessageHandler(filters.CONTACT, reg_phone),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, reg_phone),
-            ],
-            REG_ADDR:  [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_addr)],
-        },
-        fallbacks=[CommandHandler("cancel", reg_cancel), MessageHandler(filters.Regex("^لغو$"), reg_cancel)],
-        name="register",
-        persistent=False,
-    )
-
     return [
         CommandHandler("start", start),
         CommandHandler("help", help_cmd),
+        CommandHandler("menu", show_menu),
 
-        # conversations
-        addprod_conv,
-        register_conv,
+        MessageHandler(filters.Regex(f"^{BTN_MENU}$"), show_menu),
 
-        # admin cmds
-        CommandHandler("paid", paid),
-        CommandHandler("topup", topup_cmd),
-        CommandHandler("setcashback", setcashback),
+        MessageHandler(filters.Regex(f"^{BTN_WALLET}$"), wallet_entry),
+        CallbackQueryHandler(wallet_cb, pattern="^topup$"),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_text),
 
-        # main buttons
-        MessageHandler(filters.Regex("^منو 🍬$"), show_menu),
-        MessageHandler(filters.Regex("^کیف پول 👛$"), wallet),
-        MessageHandler(filters.Regex("^(شارژ کارت‌به‌کارت|بازگشت ⬅️)$"), wallet_actions),
-        MessageHandler(filters.Regex("^سفارش 🧾$"), order_entry),
+        MessageHandler(filters.Regex(f"^{BTN_ORDER}$"), order_entry),
+        MessageHandler(filters.Regex("×") & ~filters.COMMAND, order_text),
 
-        # order text (demo)
-        MessageHandler(filters.TEXT & ~filters.COMMAND, order_text),
+        ConversationHandler(
+            entry_points=[CommandHandler("register", register)],
+            states={
+                PROFILE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_name)],
+                PROFILE_PHONE:[MessageHandler(filters.TEXT & ~filters.COMMAND, profile_phone)],
+                PROFILE_ADDRESS:[MessageHandler(filters.TEXT & ~filters.COMMAND, profile_address)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_conv)],
+            name="register",
+            persistent=False
+        ),
 
-        MessageHandler(filters.Regex("^بازی 🎮$"), lambda u, c: u.effective_message.reply_text("...به‌زودی 🎲")),
-        MessageHandler(filters.Regex("^ارتباط با ما ☎️$"), lambda u, c: u.effective_message.reply_text("پیام‌ات را ارسال کن.")),
-        MessageHandler(filters.Regex("^راهنما ℹ️$"), help_cmd),
+        ConversationHandler(
+            entry_points=[CommandHandler("add", admin_add)],
+            states={
+                ADD_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_name)],
+                ADD_PRICE:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_price)],
+                ADD_PHOTO:[MessageHandler((filters.PHOTO | filters.Regex("^بدون عکس$")) & ~filters.COMMAND, add_photo)],
+                ADD_DESC:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc)],
+            },
+            fallbacks=[CommandHandler("cancel", cancel_conv)],
+            name="add_product",
+            persistent=False
+        ),
     ]
