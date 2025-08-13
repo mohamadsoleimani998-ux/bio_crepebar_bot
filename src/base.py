@@ -1,53 +1,34 @@
 import logging
 import os
-
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# -------- Logging --------
+# ---- logging
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("crepebar")
 
-# -------- Envs (required) --------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("DB_URL")
+# ---- ENV
+BOT_TOKEN        = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+DATABASE_URL     = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
+PUBLIC_URL       = (os.getenv("PUBLIC_URL") or os.getenv("WEBHOOK_BASE") or "").rstrip("/")
+WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
+CASHBACK_PERCENT = float(os.getenv("CASHBACK_PERCENT", "3") or 0)
 
-# وبهوک
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "hook-secret")  # فقط حروف ساده
-PORT = int(os.environ.get("PORT", "10000"))
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL")
+# admin ids: "111,222"
+_admin_raw = os.getenv("ADMIN_IDS", "").strip()
+ADMIN_IDS = {int(x) for x in _admin_raw.replace(" ", "").split(",") if x.isdigit()}
 
-# -------- UI texts --------
-WELCOME = (
-    "سلام! 👋 به ربات بایو کِرپ‌بار خوش اومدی.\n"
-    "از دکمه‌های زیر استفاده کن:\n"
-    "• منو 🍭: نمایش محصولات با نام و قیمت\n"
-    "• سفارش 🧾: ثبت سفارش و مشاهده فاکتور\n"
-    "• کیف پول 👛: مشاهده/شارژ، کش‌بک ۳٪ بعد هر خرید\n"
-    "• بازی 🎮: سرگرمی\n"
-    "• ارتباط با ما ☎️: پیام به ادمین\n"
-    "• راهنما ℹ️: دستورات"
-)
-
-MAIN_MENU = [
-    ["🍭 منو", "🧾 سفارش"],
-    ["👛 کیف پول", "🎮 بازی"],
-    ["☎️ ارتباط با ما", "ℹ️ راهنما"],
-]
-
-# صفحه‌بندی منو
-PAGE_SIZE = 6
-
-# علامت پول
-CURRENCY = "تومان"
-
-def fmt_money(v):
+def tman(amount) -> str:
+    """Format TOMAN with thousands separator."""
     try:
-        v = int(v)
+        v = int(round(float(amount)))
     except Exception:
-        v = float(v or 0)
-    return f"{v:,} {CURRENCY}"
+        v = 0
+    return f"{v:,} تومان"
+
+def is_admin(tg_id: int) -> bool:
+    return tg_id in ADMIN_IDS
