@@ -1,8 +1,8 @@
 from __future__ import annotations
 from decimal import Decimal
+import re
 from telegram import (
     Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton,
-    InputMediaPhoto
 )
 from telegram.ext import (
     ContextTypes, CommandHandler, MessageHandler, ConversationHandler, filters
@@ -16,6 +16,7 @@ MAIN_KB = ReplyKeyboardMarkup(
         ["منو 🍬", "سفارش 🧾"],
         ["کیف پول 👛", "بازی 🎮"],
         ["ارتباط با ما ☎️", "راهنما ℹ️"],
+        ["ثبت نام 📝"],
     ],
     resize_keyboard=True,
 )
@@ -27,7 +28,7 @@ def money(n) -> str:
         pass
     return f"{n:,} تومان".replace(",", "٬")
 
-# ---------- /start & registration light
+# ---------- /start & welcome
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     row = db.upsert_user(u.id, u.full_name)
@@ -37,6 +38,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• منو: نمایش محصولات با نام، قیمت و عکس\n"
         "• سفارش: ثبت سفارش و دریافت آدرس/شماره\n"
         f"• کیف پول: مشاهده/شارژ، کش‌بک {db.get_cashback_percent() or DEFAULT_CASHBACK}% بعد هر خرید\n"
+        "• ثبت نام: تکمیل نام، شماره و آدرس\n"
         "• بازی: سرگرمی\n"
         "• ارتباط با ما: پیام به ادمین\n"
         "• راهنما: دستورها"
@@ -126,7 +128,7 @@ def _is_admin(update: Update) -> bool:
     uid = update.effective_user.id if update.effective_user else 0
     return uid in ADMIN_IDS
 
-# ----- /addproduct conversation
+# ----- Add Product (admin)
 AP_NAME, AP_PRICE, AP_PHOTO, AP_DESC = range(4)
 
 async def addproduct_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -178,7 +180,7 @@ async def ap_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("لغو شد.", reply_markup=MAIN_KB)
     return ConversationHandler.END
 
-# ----- /paid <order_id>
+# ----- Admin commands
 async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await update.effective_message.reply_text("دسترسی نداری.")
@@ -195,7 +197,6 @@ async def paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"سفارش #{order_id} paid شد. مبلغ: {money(row[1])} | کش‌بک: {money(row[2])}"
     )
 
-# ----- /topup <telegram_id> <amount>
 async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await update.effective_message.reply_text("دسترسی نداری.")
@@ -210,7 +211,6 @@ async def topup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal = db.get_balance(u["user_id"])
     await update.effective_message.reply_text(f"شارژ انجام شد. موجودی جدید: {money(bal)}")
 
-# ----- /setcashback <percent>
 async def setcashback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return await update.effective_message.reply_text("دسترسی نداری.")
@@ -225,11 +225,67 @@ async def help_cmd(update, context):
     await update.effective_message.reply_text(
         "دستورها:\n"
         "/start – شروع\n"
+        "/register – ثبت‌نام (نام/شماره/آدرس)\n"
         "/addproduct – افزودن محصول (ادمین)\n"
         "/paid <order_id> – تأیید پرداخت (ادمین)\n"
         "/topup <tg_id> <amount> – شارژ کیف پول (ادمین)\n"
         "/setcashback <p> – تعیین درصد کش‌بک (ادمین)\n"
     )
+
+# ===================== Registration Conversation =====================
+REG_NAME, REG_PHONE, REG_ADDR = range(3)
+PHONE_RE = re.compile(r"^(?:\+?98|0)?9\d{9}$")  # موبایل ایران
+
+async def register_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ایجاد/به‌روزرسانی اولیه نام تلگرام
+    db.upsert_user(update.effective_user.id, update.effective_user.full_name)
+    await update.effective_message.reply_text(
+        "ثبت‌نام شروع شد. نامت را بفرست (یا همان نام روی پروفایل را تأیید کن):"
+    )
+    return REG_NAME
+
+async def reg_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["name"] = (update.effective_message.text or "").strip()
+    kb = ReplyKeyboardMarkup(
+        [[KeyboardButton("ارسال مخاطب من", request_contact=True)], ["لغو"]],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+    await update.effective_message.reply_text(
+        "شماره موبایل را بفرست (با 09 یا +989 شروع شود) یا دکمه «ارسال مخاطب من» را بزن.",
+        reply_markup=kb,
+    )
+    return REG_PHONE
+
+async def reg_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    phone = None
+    if update.message.contact and update.message.contact.phone_number:
+        phone = update.message.contact.phone_number
+    else:
+        phone = (update.effective_message.text or "").replace(" ", "")
+    # نرمال‌سازی ساده
+    phone = phone.replace("+98", "0") if phone.startswith("+98") else phone
+    if not PHONE_RE.match(phone):
+        await update.effective_message.reply_text("شماره نامعتبر است. دوباره بفرست یا «لغو».")
+        return REG_PHONE
+    context.user_data["phone"] = phone
+    await update.effective_message.reply_text(
+        "آدرس دقیق را بفرست (خیابان/کوچه/پلاک).",
+        reply_markup=ReplyKeyboardMarkup([["لغو"]], resize_keyboard=True, one_time_keyboard=True),
+    )
+    return REG_ADDR
+
+async def reg_addr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    addr = (update.effective_message.text or "").strip()
+    u = db.get_user_by_tg(update.effective_user.id)
+    db.update_profile(u["user_id"], name=context.user_data.get("name"), phone=context.user_data.get("phone"), address=addr)
+    await update.effective_message.reply_text("✅ ثبت‌نام تکمیل شد.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+
+async def reg_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("لغو شد.", reply_markup=MAIN_KB)
+    return ConversationHandler.END
+# =====================================================================
 
 # ---------- Router
 def build_handlers():
@@ -246,20 +302,44 @@ def build_handlers():
         persistent=False,
     )
 
+    register_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("register", register_start),
+            MessageHandler(filters.Regex("^ثبت نام 📝$"), register_start),
+        ],
+        states={
+            REG_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)],
+            REG_PHONE: [
+                MessageHandler(filters.CONTACT, reg_phone),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, reg_phone),
+            ],
+            REG_ADDR:  [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_addr)],
+        },
+        fallbacks=[CommandHandler("cancel", reg_cancel), MessageHandler(filters.Regex("^لغو$"), reg_cancel)],
+        name="register",
+        persistent=False,
+    )
+
     return [
         CommandHandler("start", start),
         CommandHandler("help", help_cmd),
+
+        # conversations
         addprod_conv,
+        register_conv,
+
+        # admin cmds
         CommandHandler("paid", paid),
         CommandHandler("topup", topup_cmd),
         CommandHandler("setcashback", setcashback),
 
+        # main buttons
         MessageHandler(filters.Regex("^منو 🍬$"), show_menu),
         MessageHandler(filters.Regex("^کیف پول 👛$"), wallet),
         MessageHandler(filters.Regex("^(شارژ کارت‌به‌کارت|بازگشت ⬅️)$"), wallet_actions),
-
         MessageHandler(filters.Regex("^سفارش 🧾$"), order_entry),
-        # ورودی سفارش
+
+        # order text (demo)
         MessageHandler(filters.TEXT & ~filters.COMMAND, order_text),
 
         MessageHandler(filters.Regex("^بازی 🎮$"), lambda u, c: u.effective_message.reply_text("...به‌زودی 🎲")),
