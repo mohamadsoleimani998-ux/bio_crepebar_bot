@@ -8,7 +8,6 @@ def main():
     if not TOKEN:
         raise RuntimeError("TOKEN env is missing (TELEGRAM_TOKEN / BOT_TOKEN).")
 
-    # ساخت/بررسی اسکیما
     db.init_db()
 
     app = Application.builder().token(TOKEN).defaults(Defaults(parse_mode=ParseMode.HTML)).build()
