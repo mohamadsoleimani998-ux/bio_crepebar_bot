@@ -1,29 +1,31 @@
 import os
 import logging
 
-# -------- Env
-TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
-PUBLIC_URL = os.getenv("PUBLIC_URL") or os.getenv("WEBHOOK_URL")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "Te1egramWebhookSecret_2025")
-PORT = int(os.getenv("PORT", "10000"))
-
-# Admins: comma/space separated Telegram ids
-def _parse_admins(val: str | None):
-    if not val:
-        return set()
-    parts = [p.strip() for p in val.replace(",", " ").split()]
-    return {int(p) for p in parts if p.isdigit()}
-
-ADMIN_IDS = _parse_admins(os.getenv("ADMIN_IDS"))
-
-# Optional default cashback percent shown in پیام‌ها؛
-# محاسبه واقعی از جدول settings انجام می‌شود.
-DEFAULT_CASHBACK = int(os.getenv("CASHBACK_PERCENT", "3"))
-
-# -------- Logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("crepebar")
+
+# ====== ENV ======
+TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "WebhookSecret")
+PORT = int(os.getenv("PORT", "10000"))
+
+# ادمین‌ها
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.isdigit()}
+
+# تنظیمات کیف‌پول
+DEFAULT_CASHBACK_PERCENT = int(os.getenv("CASHBACK_PERCENT", "3"))
+CARD_NUMBER = os.getenv("CARD_NUMBER", "5029081080984145")  # کارت به کارت
+
+# کلیدهای کیبورد
+BTN_MENU = "منو 🍬"
+BTN_ORDER = "سفارش 🧾"
+BTN_WALLET = "کیف پول 👛"
+BTN_GAME = "بازی 🎮"
+BTN_HELP = "راهنما ℹ️"
+BTN_CONTACT = "ارتباط با ما ☎️"
+BTN_WALLET_TOPUP = "شارژ کارت‌به‌کارت"
