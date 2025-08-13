@@ -1,6 +1,6 @@
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    ReplyKeyboardMarkup, KeyboardButton, InputMediaPhoto
+    ReplyKeyboardMarkup
 )
 from telegram.ext import (
     ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters
@@ -10,16 +10,32 @@ from .base import (
     DEFAULT_CASHBACK, CARD_NUMBER
 )
 from . import db
-import traceback
+import re
 
-# --- States in-memory (ساده و سبک) ---
-ADD_PRODUCT_STATE = {}   # tg_id -> {"name":..., "price":..., "photo":..., "desc":...}
-REGISTER_STATE = {}      # tg_id -> "NAME"/"PHONE"/"ADDR"
+# --- States ---
+ADD_PRODUCT_STATE = {}
+REGISTER_STATE = {}
 
 # --- Helpers ---
 def _main_kb():
     return ReplyKeyboardMarkup(MAIN_KEYBOARD, resize_keyboard=True)
 
+# نرمال‌سازی: اموجی/سیمبل‌ها حذف، فاصله‌ها ساده
+_EMOJI_RE = re.compile(r"[^\w\s\u0600-\u06FF]", flags=re.UNICODE)  # حروف/اعداد فارسی و لاتین و فاصله
+_SPACE_RE = re.compile(r"\s+")
+
+def norm(txt: str) -> str:
+    if not txt:
+        return ""
+    t = _EMOJI_RE.sub(" ", txt)          # هر چیزی غیر از حرف/عدد/فاصله را فضای خالی می‌کنیم
+    t = _SPACE_RE.sub(" ", t).strip()
+    return t
+
+def has(txt: str, *keywords: str) -> bool:
+    nt = norm(txt)
+    return any(k in nt for k in keywords)
+
+# --- Commands ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     db.upsert_user(u.id, u.full_name or u.username or str(u.id))
@@ -34,35 +50,38 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/wallet – موجودی و شارژ کیف پول\n"
     )
 
-# ---------- Register / Profile ----------
+# ---------- Register ----------
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     REGISTER_STATE[update.effective_user.id] = "NAME"
     await update.message.reply_text("نام خود را بفرستید:")
 
+# ---------- Routers ----------
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """مسیر دهی پیام‌های متنی (کیبورد فارسی + استیت‌ها)"""
     u = update.effective_user
-    txt = (update.message.text or "").strip()
+    raw = update.message.text or ""
+    txt = norm(raw)
 
-    # --- جریان ثبت‌نام ---
+    # ثبت‌نام
     if REGISTER_STATE.get(u.id) == "NAME":
-        db.set_user_profile(u.id, name=txt)
+        db.set_user_profile(u.id, name=raw.strip())
         REGISTER_STATE[u.id] = "PHONE"
         await update.message.reply_text("شماره تماس را بفرستید:")
         return
+
     if REGISTER_STATE.get(u.id) == "PHONE":
-        db.set_user_profile(u.id, phone=txt)
+        db.set_user_profile(u.id, phone=raw.strip())
         REGISTER_STATE[u.id] = "ADDR"
         await update.message.reply_text("آدرس را بفرستید:")
         return
+
     if REGISTER_STATE.get(u.id) == "ADDR":
-        db.set_user_profile(u.id, address=txt)
+        db.set_user_profile(u.id, address=raw.strip())
         REGISTER_STATE.pop(u.id, None)
         await update.message.reply_text("✅ ثبت اطلاعات انجام شد.", reply_markup=_main_kb())
         return
 
-    # --- کیبورد اصلی ---
-    if txt.endswith("منو") or txt == "🍬 منو":
+    # کیبورد اصلی
+    if has(raw, "منو", "menu"):
         prods = db.list_products()
         if not prods:
             await update.message.reply_text("فعلاً محصولی ثبت نشده.")
@@ -77,11 +96,11 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(cap)
         return
 
-    if txt.endswith("سفارش") or txt == "🧾 سفارش":
+    if has(raw, "سفارش", "order"):
         await update.message.reply_text("نام محصول و تعداد را بنویس (مثال: «اسپرسو x2»). (دموی ساده)")
         return
 
-    if txt.endswith("کیف پول") or txt == "👛 کیف پول":
+    if has(raw, "کیف پول", "کیف", "wallet"):
         user = db.get_user_by_tg(u.id)
         bal = user["wallet"] if user else 0
         kb = InlineKeyboardMarkup([[
@@ -93,34 +112,35 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if txt.endswith("بازی") or txt == "🎮 بازی":
+    if has(raw, "بازی", "game"):
         await update.message.reply_text("🎲 به‌زودی…")
         return
 
-    if txt.endswith("ارتباط با ما") or txt == "📞 ارتباط با ما":
+    if has(raw, "ارتباط با ما", "ارتباط", "contact"):
         await update.message.reply_text("پیامت را بنویس؛ برای ادمین ارسال می‌شود.")
         return
 
-    if txt.endswith("راهنما") or txt == "ℹ️ راهنما":
+    if has(raw, "راهنما", "help"):
         await help_cmd(update, context)
         return
 
     # --- جریان ادمین Add Product ---
     if ADD_PRODUCT_STATE.get(u.id, {}).get("await") == "PRICE":
         try:
-            # فقط ارقام فارسی/لاتین را نگه‌دار
-            numbers = "".join(ch for ch in txt if ch.isdigit())
+            numbers = "".join(ch for ch in raw if ch.isdigit())
             price = int(numbers)
             ADD_PRODUCT_STATE[u.id]["price"] = price
             ADD_PRODUCT_STATE[u.id]["await"] = "PHOTO"
             await update.message.reply_text("عکس محصول را بفرست (یا بنویس «بدون عکس»).")
-        except Exception as e:
+        except Exception:
             await update.message.reply_text("قیمت نامعتبر است. فقط عدد بفرست.")
         return
 
     if ADD_PRODUCT_STATE.get(u.id, {}).get("await") == "DESC":
         try:
-            desc = txt if txt != "بدون توضیحات" else None
+            desc = raw.strip()
+            if has(desc, "بدون توضیحات"):
+                desc = None
             st = ADD_PRODUCT_STATE.pop(u.id, {})
             row = db.add_product(st.get("name"), st.get("price"), st.get("photo"), desc)
             await update.message.reply_text(f"✅ محصول ثبت شد: {row['name']} – {row['price']:,} تومان")
@@ -129,10 +149,8 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ خطای غیرمنتظره. لطفاً دوباره تلاش کنید.")
         return
 
-    # اگر به هیچ‌جا نخورد
     await update.message.reply_text("متوجه نشدم؛ از کیبورد پایین استفاده کن یا /help .")
 
-# عکس در حالت AddProduct
 async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     st = ADD_PRODUCT_STATE.get(u.id, {})
@@ -143,7 +161,7 @@ async def photo_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("توضیحات کوتاه (اختیاری) را بفرست. اگر نمی‌خواهی بنویس «بدون توضیحات».")
         return
 
-# ادمین: شروع افزودن محصول
+# Admin: add product
 async def addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("فقط ادمین‌ها اجازه این کار را دارند.")
@@ -151,7 +169,7 @@ async def addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ADD_PRODUCT_STATE[update.effective_user.id] = {"await": "NAME"}
     await update.message.reply_text("نام محصول را بفرست:")
 
-# گرفتن نام محصول (اولین قدم AddProduct)
+# First-step name catch for addproduct
 async def any_text_first(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     st = ADD_PRODUCT_STATE.get(u.id)
@@ -160,10 +178,8 @@ async def any_text_first(update: Update, context: ContextTypes.DEFAULT_TYPE):
         st["await"] = "PRICE"
         await update.message.reply_text("قیمت (تومان) را بفرست:")
         return
-    # سایر متن‌ها را به روتر اصلی بده
     await text_router(update, context)
 
-# کلیک‌ها (مثلاً شارژ کیف‌پول)
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -175,13 +191,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "پس از تایید ادمین شارژ می‌شود."
         )
 
-# فرمان ساده شارژ (ادمین تایید کند)
 async def admin_add_credit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
     try:
-        # مثال: /credit 1606170079 50000
-        _, tg, amount = update.message.text.split()
+        _, tg, amount = (update.message.text or "").split()
         tg = int(tg); amount = int(amount)
         new_bal = db.wallet_change(tg, amount, "TOPUP", "MANUAL_ADMIN")
         await update.message.reply_text(f"✅ موجودی کاربر {tg} به {new_bal:,} تومان رسید.")
@@ -195,10 +209,9 @@ def build_handlers():
         CommandHandler("register", register),
         CommandHandler("addproduct", addproduct),
         CommandHandler("wallet", text_router),
-        CommandHandler("credit", admin_add_credit),  # فقط برای ادمین
+        CommandHandler("credit", admin_add_credit),
         CallbackQueryHandler(on_callback),
 
-        # ترتیب مهم است:
         MessageHandler(filters.PHOTO, photo_router),
         MessageHandler(filters.TEXT & ~filters.COMMAND, any_text_first),
     ]
