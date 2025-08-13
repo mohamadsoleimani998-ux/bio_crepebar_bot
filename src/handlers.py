@@ -1,7 +1,6 @@
 # src/handlers.py
 from __future__ import annotations
-
-from math import ceil
+from dataclasses import dataclass
 from typing import List, Tuple
 
 from telegram import (
@@ -9,7 +8,7 @@ from telegram import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
-    KeyboardButton,
+    KeyboardButton
 )
 from telegram.ext import (
     ContextTypes,
@@ -17,225 +16,337 @@ from telegram.ext import (
     MessageHandler,
     CallbackQueryHandler,
     filters,
+    Handler,
 )
+
+from .base import ADMIN_IDS, log
 from . import db
 
-# ---------- تنظیمات نمایشی ----------
-MAIN_BTNS = [
-    [ "منو 🍭", "سفارش 🧾" ],
-    [ "کیف پول 👛", "بازی 🎮" ],
-    [ "ارتباط با ما ☎️", "راهنما ℹ️" ],
-]
-PAGE_SIZE = 8  # تعداد محصولات در هر صفحه
-CURRENCY = "تومان"
+# ==============================
+# ثابت‌ها (متن فارسی دکمه‌ها)
+# ==============================
+BTN_MENU      = "منو 🍭"
+BTN_ORDER     = "سفارش 🧾"
+BTN_WALLET    = "کیف پول 👛"
+BTN_HELP      = "راهنما ℹ️"
+BTN_CONTACT   = "ارتباط با ما ☎️"
 
-def _main_kb() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(MAIN_BTNS, resize_keyboard=True)
+BTN_VIEW_INVOICE = "مشاهده فاکتور 🧾"
+BTN_PAY_WALLET   = "پرداخت از کیف پول 👛"
+BTN_PAY_CASH     = "پرداخت مستقیم 💳"   # (کارت‌به‌کارت/حضوری)
+BTN_BACK_MENU    = "بازگشت به منو ◀️"
 
-def _fmt_price(v: int | float) -> str:
-    return f"{int(v):,} {CURRENCY}".replace(",", "٬")
+# callback prefixes
+CB_PROD   = "prod:"     # prod:<id>
+CB_PAGE   = "page:"     # page:<page>
+CB_INC    = "inc:"      # inc:<product_id>
+CB_DEC    = "dec:"      # dec:<product_id>
+CB_REM    = "rem:"      # rem:<product_id>
+CB_INV    = "invoice"   # invoice
+CB_PAY_W  = "pay:wallet"
+CB_PAY_C  = "pay:cash"
 
-# ---------- کمک‌متدهای UI ----------
-def _products_markup(products: List[dict], page: int, total: int) -> InlineKeyboardMarkup:
-    """ساخت دکمه‌های منو + صفحه‌بندی + مشاهده فاکتور"""
-    rows: List[List[InlineKeyboardButton]] = []
+PAGE_SIZE = 6
+
+# ==============================
+# کیبورد Reply اصلی
+# ==============================
+def main_keyboard() -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(BTN_MENU), KeyboardButton(BTN_ORDER)],
+        [KeyboardButton(BTN_WALLET), KeyboardButton("بازی 🎮")],
+        [KeyboardButton(BTN_CONTACT), KeyboardButton(BTN_HELP)],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+# ==============================
+# ابزارهای نمایشی
+# ==============================
+def fmt_price(n: float) -> str:
+    try:
+        n = float(n)
+    except Exception:
+        return str(n)
+    s = f"{int(n):,}".replace(",", "،")
+    return f"{s} تومان"
+
+def product_list_kb(page: int, products: List[dict], total: int) -> InlineKeyboardMarkup:
+    btns: List[List[InlineKeyboardButton]] = []
+
     for p in products:
-        title = f"{_fmt_price(p['price'])} — {p['name']}"
-        rows.append([InlineKeyboardButton(title, callback_data=f"prod:{p['product_id']}")])
+        title = f"{fmt_price(p['price'])} — {p['name']}"
+        btns.append([InlineKeyboardButton(title, callback_data=f"{CB_PROD}{p['id']}")])
 
-    # صفحه‌بندی
-    pages = max(1, ceil(total / PAGE_SIZE))
-    nav_row: List[InlineKeyboardButton] = []
+    # نوار صفحه‌بندی
+    max_page = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    pager = [InlineKeyboardButton(f"{page}/{max_page}", callback_data="noop")]
     if page > 1:
-        nav_row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"menu:{page-1}"))
-    nav_row.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="noop"))
-    if page < pages:
-        nav_row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"menu:{page+1}"))
-    rows.append(nav_row)
+        pager.insert(0, InlineKeyboardButton("◀️", callback_data=f"{CB_PAGE}{page-1}"))
+    if page < max_page:
+        pager.append(InlineKeyboardButton("▶️", callback_data=f"{CB_PAGE}{page+1}"))
+    btns.append(pager)
 
-    # فاکتور
-    rows.append([InlineKeyboardButton("🧾 مشاهده فاکتور", callback_data="order:show")])
+    btns.append([InlineKeyboardButton(BTN_VIEW_INVOICE, callback_data=CB_INV)])
+    return InlineKeyboardMarkup(btns)
+
+def invoice_kb(items_exist: bool) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if items_exist:
+        rows.append([InlineKeyboardButton(BTN_PAY_WALLET, callback_data=CB_PAY_W)])
+        rows.append([InlineKeyboardButton(BTN_PAY_CASH,   callback_data=CB_PAY_C)])
+    rows.append([InlineKeyboardButton("ادامه خرید از منو 🍭", callback_data=f"{CB_PAGE}1")])
     return InlineKeyboardMarkup(rows)
 
-async def _send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 1) -> None:
-    """نمایش منوی محصولات با صفحه‌بندی"""
-    user = update.effective_user
-    u = db.upsert_user(user.id, user.full_name or user.first_name or "")
-    offset = (page - 1) * PAGE_SIZE
-    products = db.get_products_page(offset=offset, limit=PAGE_SIZE)
-    total = db.count_products()
-    if not products:
-        await update.effective_chat.send_message(
-            "هنوز محصولی ثبت نشده است.", reply_markup=_main_kb()
-        )
-        return
-    await update.effective_chat.send_message(
-        "منو:",
-        reply_markup=_products_markup(products, page=page, total=total),
-    )
+def order_items_kb(items: List[dict]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    for it in items:
+        name = it["name"]
+        qty  = it["qty"]
+        pid  = it["product_id"]
+        rows.append([
+            InlineKeyboardButton(f"➖", callback_data=f"{CB_DEC}{pid}"),
+            InlineKeyboardButton(f"{name} × {qty}", callback_data="noop"),
+            InlineKeyboardButton(f"➕", callback_data=f"{CB_INC}{pid}"),
+            InlineKeyboardButton(f"🗑", callback_data=f"{CB_REM}{pid}"),
+        ])
+    rows.append([InlineKeyboardButton(BTN_PAY_WALLET, callback_data=CB_PAY_W)])
+    rows.append([InlineKeyboardButton(BTN_PAY_CASH,   callback_data=CB_PAY_C)])
+    rows.append([InlineKeyboardButton("ادامه خرید از منو 🍭", callback_data=f"{CB_PAGE}1")])
+    return InlineKeyboardMarkup(rows)
 
-# ---------- فرمان‌ها ----------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.upsert_user(user.id, user.full_name or user.first_name or "")
+# ==============================
+# ورود/ثبت نام ساده
+# ==============================
+async def ensure_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    tg = update.effective_user
+    db.upsert_user(tg.id, (tg.full_name or "").strip())
+    u = db.get_user(tg.id)
+    return int(u["id"])
+
+# ==============================
+# /start
+# ==============================
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await ensure_user(update, ctx)
     text = (
         "سلام! 👋 به ربات بایو کرپ‌بار خوش اومدی.\n"
         "از دکمه‌های زیر استفاده کن:\n"
-        "• منو: نمایش محصولات با نام، قیمت و عکس\n"
-        "• سفارش: ثبت سفارش و دریافت آدرس/شماره\n"
-        "• کیف پول: مشاهده/شارژ، کش‌بک ۳٪ بعد هر خرید\n"
-        "• بازی: سرگرمی\n"
-        "• ارتباط با ما: پیام به ادمین\n"
-        "• راهنما: دستورات"
+        f"• {BTN_MENU}: نمایش محصولات\n"
+        f"• {BTN_ORDER}: ثبت سفارش و فاکتور\n"
+        f"• {BTN_WALLET}: مشاهده/شارژ کیف‌پول و کش‌بک ۳٪ بعد هر خرید\n"
+        f"• {BTN_HELP}: راهنما"
     )
-    await update.effective_chat.send_message(text, reply_markup=_main_kb())
+    await update.effective_message.reply_text(text, reply_markup=main_keyboard())
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message("برای شروع «منو 🍭» یا «سفارش 🧾» را بزن.", reply_markup=_main_kb())
-
-async def wallet_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    u = db.upsert_user(user.id, user.full_name or user.first_name or "")
-    bal = db.get_balance(u["user_id"])
-    percent = db.get_cashback_percent()
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("💳 شارژ کارت‌به‌کارت", callback_data="wallet:topup")]]
-    )
-    await update.effective_chat.send_message(
-        f"موجودی شما: {_fmt_price(bal)}\nکش‌بک فعال: {percent}٪",
-        reply_markup=kb,
-    )
-
-async def order_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """نمایش فاکتور سفارش جاری"""
-    user = update.effective_user
-    u = db.upsert_user(user.id, user.full_name or user.first_name or "")
-    order_id = db.ensure_draft_order(u["user_id"])
-    items, meta = db.get_order_summary(order_id)
-    if not items:
-        await update.effective_chat.send_message("فاکتور خالی است. از «منو 🍭» محصول انتخاب کن.", reply_markup=_main_kb())
+# ==============================
+# منو (نمایش محصولات با دکمه اینلاین)
+# ==============================
+async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, page: int = 1):
+    uid = await ensure_user(update, ctx)
+    products, total = db.list_products(page=page, page_size=PAGE_SIZE)
+    if not products:
+        await update.effective_message.reply_text("هنوز محصول فعالی ثبت نشده.", reply_markup=main_keyboard())
         return
-    lines = ["🧾 فاکتور جاری:"]
+    await update.effective_message.reply_text(
+        "منو:",
+        reply_markup=product_list_kb(page, products, total),
+    )
+
+# ==============================
+# سفارش/فاکتور
+# ==============================
+def _format_invoice(order: dict, items: List[dict]) -> str:
+    if not order or not items:
+        return "سبد خرید خالی است."
+    lines = ["فاکتور موقت:\n"]
+    total = 0
     for it in items:
-        lines.append(f"• {it['name']} ×{it['qty']} — {_fmt_price(it['line_total'])}")
-    lines.append(f"\nجمع کل: {_fmt_price(meta['total_amount'])}")
+        lt = float(it["line_total"])
+        total += lt
+        lines.append(f"• {it['name']} × {it['qty']} = {fmt_price(lt)}")
+    lines.append(f"\nجمع کل: {fmt_price(total)}")
+    return "\n".join(lines)
 
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ پرداخت از کیف پول", callback_data="pay:wallet")],
-        [InlineKeyboardButton("💳 پرداخت مستقیم", callback_data="pay:direct")],
-    ])
-    await update.effective_chat.send_message("\n".join(lines), reply_markup=kb)
+async def show_invoice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = await ensure_user(update, ctx)
+    order, items = db.get_draft_with_items(uid)
+    if not order or not items:
+        await update.effective_message.reply_text("سبد خرید خالی است.", reply_markup=main_keyboard())
+        return
+    text = _format_invoice(order, items)
+    await update.effective_message.reply_text(text, reply_markup=order_items_kb(items))
 
-# ---------- کلیک‌ روی دکمه‌ها ----------
-async def cb_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """صفحه‌بندی منو"""
+# ==============================
+# کیف پول
+# ==============================
+async def show_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = await ensure_user(update, ctx)
+    bal = db.get_balance(uid)
+    txt = f"موجودی شما: {fmt_price(bal)}\nکش‌بک فعال: %3"
+    kb = InlineKeyboardMarkup.from_button(
+        InlineKeyboardButton("شارژ کارت‌به‌کارت 🧾", callback_data="topup")
+    )
+    await update.effective_message.reply_text(txt, reply_markup=kb)
+
+# ==============================
+# Callback ها
+# ==============================
+async def cb_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not q:
+        return
+    data = q.data or ""
     await q.answer()
-    try:
-        page = int(q.data.split(":")[1])
-    except Exception:
-        page = 1
-    await _send_menu(update, context, page=page)
 
-async def cb_noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-
-async def cb_show_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.callback_query.answer()
-    # پاس بده به همون هندلر سفارش
-    # (اینجا از edit_message_text هم می‌شه استفاده کرد؛ ساده نگه داشتیم)
-    await order_msg(update, context)
-
-async def cb_pick_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """افزودن محصول به سفارش (از دکمه منو)"""
-    q = update.callback_query
-    await q.answer("به سبد اضافه شد ✅", show_alert=False)
-    user = update.effective_user
-    u = db.upsert_user(user.id, user.full_name or user.first_name or "")
-    order_id = db.ensure_draft_order(u["user_id"])
-    product_id = int(q.data.split(":")[1])
-    db.add_or_inc_item(order_id, product_id, qty=1)
-    # آپدیت Toast کافیست؛ اگر خواستی می‌توانی دکمه فاکتور را هم جدا بفرستی
-    # هیچ تغییر دیگری لازم نیست.
-
-async def cb_pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    user = update.effective_user
-    u = db.upsert_user(user.id, user.full_name or user.first_name or "")
-    order_id = db.ensure_draft_order(u["user_id"])
-    items, meta = db.get_order_summary(order_id)
-
-    total = int(meta["total_amount"])
-    bal = int(db.get_balance(u["user_id"]))
-    if total <= 0 or not items:
-        await q.edit_message_text("فاکتور خالی است.")
+    # صفحه‌بندی منو
+    if data.startswith(CB_PAGE):
+        page = int(data.split(":")[1])
+        products, total = db.list_products(page=page, page_size=PAGE_SIZE)
+        await q.edit_message_reply_markup(reply_markup=product_list_kb(page, products, total))
         return
 
-    if bal < total:
-        await q.edit_message_text(
-            f"موجودی کافی نیست. موجودی: {_fmt_price(bal)} — مبلغ فاکتور: {_fmt_price(total)}\n"
-            "از «کیف پول 👛» شارژ کنید."
+    # انتخاب محصول از منو
+    if data.startswith(CB_PROD):
+        pid = int(data.split(":")[1])
+        uid = await ensure_user(update, ctx)
+        order_id = db.open_draft_order(uid)
+        p = db.get_product(pid)
+        if not p:
+            await q.edit_message_text("این محصول در دسترس نیست.")
+            return
+        db.add_or_increment_item(order_id, pid, float(p["price"]), inc=1)
+        await q.answer("به سبد اضافه شد ✅", show_alert=False)
+        # فاکتورِ خلاصه
+        order, items = db.get_draft_with_items(uid)
+        await q.message.reply_text(_format_invoice(order, items), reply_markup=order_items_kb(items))
+        return
+
+    # افزایش/کاهش/حذف از فاکتور
+    if data.startswith(CB_INC) or data.startswith(CB_DEC) or data.startswith(CB_REM):
+        uid = await ensure_user(update, ctx)
+        order_id = db.open_draft_order(uid)
+        pid = int(data.split(":")[1])
+
+        if data.startswith(CB_INC):
+            p = db.get_product(pid)
+            if p:
+                db.add_or_increment_item(order_id, pid, float(p["price"]), inc=1)
+        elif data.startswith(CB_DEC):
+            db.change_item_qty(order_id, pid, delta=-1)
+        else:  # REM
+            db.remove_item(order_id, pid)
+
+        order, items = db.get_draft_with_items(uid)
+        # آپدیت پیام فاکتور (اگر ساختارش فرق داشت، پیام جدید بفرست)
+        try:
+            await q.edit_message_text(_format_invoice(order, items), reply_markup=order_items_kb(items))
+        except Exception:
+            await q.message.reply_text(_format_invoice(order, items), reply_markup=order_items_kb(items))
+        return
+
+    # نمایش فاکتور از منو
+    if data == CB_INV:
+        await show_invoice(update, ctx)
+        return
+
+    # پرداخت
+    if data == CB_PAY_W:
+        await pay_with_wallet(update, ctx)
+        return
+
+    if data == CB_PAY_C:
+        await mark_direct_payment(update, ctx)
+        return
+
+    # شارژ
+    if data == "topup":
+        await q.message.reply_text(
+            "برای شارژ کارت‌به‌کارت، مبلغ دلخواه را به کارت زیر واریز کنید و رسید را برای ادمین ارسال کنید:\n"
+            "شماره کارت: 5029-0810-8098-4145\n"
+            "پس از تایید، مبلغ به کیف‌پول شما افزوده می‌شود."
         )
         return
 
-    # در db.py باید پرداخت از کیف پول پیاده‌سازی شده باشد (کسر موجودی + تغییر وضعیت)
-    # معمولاً با ثبت tx منفی (kind='order') و set_order_status('paid')
-    # اینجا فقط پیام می‌دهیم؛ جزئیات را به همان تابع‌های db می‌سپاریم:
-    # db.pay_with_wallet(u['user_id'], order_id)  <-- اگر چنین تابعی دارید
-    # برای سازگاری با نسخه فعلی فقط پیام می‌دهیم:
-    await q.edit_message_text("پرداخت از کیف پول ثبت شد ✅ (دمو)")
-    # اگر تابع دارید، بعد از موفقیت، می‌توانید: db.set_order_status(order_id, 'paid')
+# ==============================
+# پرداخت‌ها
+# ==============================
+async def pay_with_wallet(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = await ensure_user(update, ctx)
+    order, items = db.get_draft_with_items(uid)
+    if not order or not items:
+        await update.effective_message.reply_text("سبد خرید خالی است.")
+        return
 
-async def cb_pay_direct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.edit_message_text(
-        "پرداخت مستقیم به‌زودی…\nفعلاً از «کیف پول 👛» استفاده کنید."
+    total = float(order["total_amount"])
+    bal = db.get_balance(uid)
+    if bal < total:
+        need = total - bal
+        await update.effective_message.reply_text(
+            f"موجودی کافی نیست. {fmt_price(need)} دیگر لازم دارید.",
+            reply_markup=invoice_kb(True),
+        )
+        return
+
+    # کسر از کیف و ثبت پرداخت
+    # از اتصال db استفاده می‌کنیم
+    with db._conn() as cn, cn.cursor() as cur:  # type: ignore
+        # 1) کسر از کیف (ثبت تراکنش منفی)
+        cur.execute(
+            "INSERT INTO wallet_transactions(user_id, kind, amount, meta) "
+            "VALUES (%s,'order', %s, jsonb_build_object('order_id', %s))",
+            (uid, -total, int(order["order_id"])),
+        )
+        # 2) تغییر وضعیت سفارش
+        cur.execute("UPDATE orders SET status='paid' WHERE order_id=%s", (int(order["order_id"]),))
+
+    await update.effective_message.reply_text(
+        "پرداخت با موفقیت انجام شد ✅\nکش‌بک تا چند لحظه دیگر به کیف شما افزوده می‌شود.",
+        reply_markup=main_keyboard()
     )
 
-async def cb_wallet_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    await q.edit_message_text(
-        "برای شارژ کارت‌به‌کارت:\n"
-        "💳 5029 0810 8098 4145\n"
-        "فیش را همین‌جا ارسال کنید تا شارژ شود."
+async def mark_direct_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = await ensure_user(update, ctx)
+    order, items = db.get_draft_with_items(uid)
+    if not order or not items:
+        await update.effective_message.reply_text("سبد خرید خالی است.")
+        return
+
+    with db._conn() as cn, cn.cursor() as cur:  # type: ignore
+        cur.execute("UPDATE orders SET status='submitted' WHERE order_id=%s", (int(order["order_id"]),))
+
+    await update.effective_message.reply_text(
+        "سفارش ثبت شد. برای پرداخت مستقیم (کارت‌به‌کارت) لطفاً رسید را برای ادمین ارسال کنید.\n"
+        "پس از تایید، وضعیت به *paid* تغییر می‌کند.",
+        reply_markup=main_keyboard()
     )
 
-# ---------- تطبیق پیام‌های متنی با منو ----------
-async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if txt.startswith("منو"):
-        await _send_menu(update, context, page=1)
-    elif txt.startswith("سفارش"):
-        await order_msg(update, context)
-    elif txt.startswith("کیف پول"):
-        await wallet_msg(update, context)
-    elif txt.startswith("راهنما"):
-        await help_cmd(update, context)
-    elif txt.startswith("ارتباط"):
-        await update.effective_chat.send_message("برای ارتباط: @YourAdmin", reply_markup=_main_kb())
-    elif txt.startswith("بازی"):
-        await update.effective_chat.send_message("…به‌زودی", reply_markup=_main_kb())
+# ==============================
+# مسیج‌هندهرهای متنی
+# ==============================
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    txt = (update.effective_message.text or "").strip()
+    if txt == BTN_MENU:
+        await show_menu(update, ctx, page=1)
+    elif txt == BTN_ORDER or txt == BTN_VIEW_INVOICE:
+        await show_invoice(update, ctx)
+    elif txt == BTN_WALLET:
+        await show_wallet(update, ctx)
+    elif txt == BTN_HELP:
+        await update.effective_message.reply_text(
+            "راهنما:\n"
+            "از «منو» محصول انتخاب کن و به سبد اضافه کن. سپس «مشاهده فاکتور» را بزن و پرداخت را انجام بده."
+        )
     else:
-        await update.effective_chat.send_message("از منوی پایین انتخاب کن ✨", reply_markup=_main_kb())
+        await update.effective_message.reply_text("از دکمه‌های پایین استفاده کن 🙏", reply_markup=main_keyboard())
 
-# ---------- ثبت هندلرها ----------
-def build_handlers():
+# ==============================
+# Build handlers
+# ==============================
+def build_handlers() -> List[Handler]:
     return [
-        CommandHandler("start", start_cmd),
-        CommandHandler("help", help_cmd),
-
-        # پیام‌های منویی
-        MessageHandler(filters.TEXT & ~filters.COMMAND, text_router),
-
+        CommandHandler("start", cmd_start),
+        # متنی
+        MessageHandler(filters.TEXT & ~filters.COMMAND, on_text),
         # کال‌بک‌ها
-        CallbackQueryHandler(cb_pick_product, pattern=r"^prod:\d+$"),
-        CallbackQueryHandler(cb_menu,         pattern=r"^menu:\d+$"),
-        CallbackQueryHandler(cb_noop,         pattern=r"^noop$"),
-        CallbackQueryHandler(cb_show_order,   pattern=r"^order:show$"),
-        CallbackQueryHandler(cb_pay_wallet,   pattern=r"^pay:wallet$"),
-        CallbackQueryHandler(cb_pay_direct,   pattern=r"^pay:direct$"),
-        CallbackQueryHandler(cb_wallet_topup, pattern=r"^wallet:topup$"),
+        CallbackQueryHandler(cb_router),
     ]
