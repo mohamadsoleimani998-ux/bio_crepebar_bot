@@ -1,7 +1,7 @@
+# src/db.py
 import os
 import psycopg2
 from psycopg2.extras import DictCursor
-
 from .base import log
 
 DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("DB_URL")
@@ -196,40 +196,53 @@ def init_db():
 # کوئری‌های دامنه کسب‌وکار (Products/Users/Orders/Wallet)
 # =========================================================
 
+# ---------- Settings ----------
+def get_cashback_percent() -> int:
+    with _conn() as cn, cn.cursor() as cur:
+        cur.execute("SELECT COALESCE(NULLIF(value,'')::INT, 0) FROM settings WHERE key='cashback_percent'")
+        row = cur.fetchone()
+        return int(row[0] if row and row[0] is not None else 0)
+
 # ---------- Products ----------
 def get_product(product_id: int):
     with _conn() as cn, cn.cursor(cursor_factory=DictCursor) as cur:
-        cur.execute("""SELECT product_id AS id, name, price
+        cur.execute("""SELECT product_id, name, price
                          FROM products
                         WHERE product_id=%s AND is_active=TRUE""", (product_id,))
         return cur.fetchone()
 
-def list_products(page: int = 1, page_size: int = 6):
-    off = (page - 1) * page_size
-    with _conn() as cn, cn.cursor(cursor_factory=DictCursor) as cur:
+def count_products() -> int:
+    with _conn() as cn, cn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM products WHERE is_active=TRUE")
-        total = cur.fetchone()[0]
+        return int(cur.fetchone()[0])
+
+def get_products_page(offset: int = 0, limit: int = 8):
+    with _conn() as cn, cn.cursor(cursor_factory=DictCursor) as cur:
         cur.execute("""
-            SELECT product_id AS id, name, price
+            SELECT product_id, name, price
               FROM products
              WHERE is_active=TRUE
              ORDER BY product_id DESC
              LIMIT %s OFFSET %s
-        """, (page_size, off))
-        return cur.fetchall(), total
+        """, (limit, offset))
+        return cur.fetchall()
 
 # ---------- Users ----------
 def upsert_user(tg_id: int, name: str):
-    with _conn() as cn, cn.cursor() as cur:
+    """ثبت/به‌روزرسانی نام کاربر و برگرداندن رکورد کاربر (با user_id)."""
+    with _conn() as cn, cn.cursor(cursor_factory=DictCursor) as cur:
         cur.execute("""
             INSERT INTO users(telegram_id, name)
             VALUES (%s, %s)
             ON CONFLICT (telegram_id) DO UPDATE SET name=EXCLUDED.name
         """, (tg_id, name))
+        cur.execute("""SELECT user_id, telegram_id, name, balance
+                         FROM users WHERE telegram_id=%s""", (tg_id,))
+        return cur.fetchone()
 
 def get_user(tg_id: int):
     with _conn() as cn, cn.cursor(cursor_factory=DictCursor) as cur:
-        cur.execute("""SELECT user_id AS id, telegram_id, name, balance
+        cur.execute("""SELECT user_id, telegram_id, name, balance
                          FROM users WHERE telegram_id=%s""", (tg_id,))
         return cur.fetchone()
 
@@ -240,7 +253,8 @@ def get_balance(user_id: int) -> float:
         return float(row[0] or 0)
 
 # ---------- Orders ----------
-def open_draft_order(user_id: int) -> int:
+def ensure_draft_order(user_id: int) -> int:
+    """اگر سفارش draft موجود بود همان را بده؛ وگرنه بساز و برگردان."""
     with _conn() as cn, cn.cursor() as cur:
         cur.execute("""SELECT order_id FROM orders
                         WHERE user_id=%s AND status='draft'""", (user_id,))
@@ -251,22 +265,26 @@ def open_draft_order(user_id: int) -> int:
                        VALUES (%s,'draft') RETURNING order_id""", (user_id,))
         return cur.fetchone()[0]
 
-def add_or_increment_item(order_id: int, product_id: int, unit_price: float, inc: int = 1):
-    """اگر آیتم وجود داشت تعداد را زیاد می‌کند؛ در پایان مجموع سفارش را آپدیت می‌کند."""
+def add_or_inc_item(order_id: int, product_id: int, qty: int = 1) -> None:
+    """آیتم را با قیمت فعلی کالا اضافه/افزایش می‌دهد و مجموع را به‌روز می‌کند."""
+    prod = get_product(product_id)
+    if not prod:
+        raise ValueError("Product not found")
+    unit_price = float(prod["price"])
     with _conn() as cn, cn.cursor() as cur:
-        # اگر رکورد نبود، بساز
+        # اگر وجود ندارد ایجاد کن
         cur.execute("""
             INSERT INTO order_items(order_id, product_id, qty, unit_price)
             VALUES (%s,%s,%s,%s)
             ON CONFLICT DO NOTHING
-        """, (order_id, product_id, inc, unit_price))
-        # در هر صورت افزایش بده
+        """, (order_id, product_id, 0, unit_price))
+        # افزایش تعداد
         cur.execute("""
             UPDATE order_items
-               SET qty = qty + %s
+               SET qty = qty + %s, unit_price = %s
              WHERE order_id=%s AND product_id=%s
-        """, (inc, order_id, product_id))
-        # به‌روزرسانی مجموع
+        """, (qty, unit_price, order_id, product_id))
+        # آپدیت مجموع
         cur.execute("SELECT fn_recalc_order_total(%s)", (order_id,))
 
 def change_item_qty(order_id: int, product_id: int, delta: int) -> bool:
@@ -297,24 +315,30 @@ def remove_item(order_id: int, product_id: int):
                     (order_id, product_id))
         cur.execute("SELECT fn_recalc_order_total(%s)", (order_id,))
 
-def get_draft_with_items(user_id: int):
+def get_order_summary(order_id: int):
+    """برمی‌گرداند: (items, meta) برای نمایش فاکتور."""
     with _conn() as cn, cn.cursor(cursor_factory=DictCursor) as cur:
-        cur.execute("""SELECT * FROM orders
-                        WHERE user_id=%s AND status='draft'""", (user_id,))
+        cur.execute("""SELECT order_id, user_id, status, total_amount, cashback_amount
+                         FROM orders WHERE order_id=%s""", (order_id,))
         order = cur.fetchone()
         if not order:
-            return None, []
-        oid = order["order_id"]
+            return [], {"total_amount": 0, "cashback_amount": 0}
         cur.execute("""
-            SELECT oi.product_id,
-                   p.name,
-                   oi.qty,
-                   oi.unit_price,
+            SELECT oi.product_id AS product_id,
+                   p.name        AS name,
+                   oi.qty        AS qty,
+                   oi.unit_price AS unit_price,
                    (oi.qty * oi.unit_price) AS line_total
               FROM order_items oi
               JOIN products p ON p.product_id = oi.product_id
              WHERE oi.order_id=%s
              ORDER BY oi.item_id
-        """, (oid,))
+        """, (order_id,))
         items = cur.fetchall()
-        return order, items
+        meta = {
+            "order_id":        order["order_id"],
+            "status":          order["status"],
+            "total_amount":    float(order["total_amount"] or 0),
+            "cashback_amount": float(order["cashback_amount"] or 0),
+        }
+        return items, meta
