@@ -1,41 +1,48 @@
 import os
 import logging
 
-# --- Logging ---
+# ---- Logging ----
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("crepebar")
 
-# --- Env ---
-TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or ""
-PUBLIC_URL = (os.getenv("WEBHOOK_URL") or os.getenv("PUBLIC_URL") or "").rstrip("/")
+# ---- Env ----
+TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+PUBLIC_URL = (os.getenv("WEBHOOK_URL") or os.getenv("PUBLIC_URL") or "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
 PORT = int(os.getenv("PORT", "10000"))
 
-# Admin ids: comma/space separated
-def _parse_admins(val: str):
-    if not val:
+# ادمین‌ها (با کاما جدا شده)
+def _parse_admins(v: str):
+    if not v:
         return set()
-    parts = []
-    for ch in [",", " ", ";", "|"]:
-        if ch in val:
-            parts = [p for p in val.replace(ch, " ").split() if p]
-    if not parts:
-        parts = [val]
-    try:
-        return {int(p) for p in parts}
-    except Exception:
-        return set()
+    return {int(x.strip()) for x in v.split(",") if x.strip().lstrip("-").isdigit()}
 
 ADMIN_IDS = _parse_admins(os.getenv("ADMIN_IDS", ""))
 
-CASHBACK_PERCENT = int(os.getenv("CASHBACK_PERCENT", "3"))
+# درصد کش‌بک پیش‌فرض
+DEFAULT_CASHBACK = int(os.getenv("CASHBACK_PERCENT", "3"))
 
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DATABASE_URL".lower())
-if not TOKEN:
-    log.error("TOKEN is missing. Set TELEGRAM_TOKEN or BOT_TOKEN env")
+# شماره کارت برای شارژ کیف‌پول (کارت به کارت)
+CARD_NUMBER = os.getenv("CARD_NUMBER", "5029081080984145")
 
-# Static data
-CARD_NUMBER = "5029081080984145"   # برای شارژ کیف پول (کارت به کارت)
+# متن‌های آماده
+WELCOME_TEXT = (
+    "سلام! 👋 به ربات بایو کرِپ‌بار خوش اومدی.\n"
+    "از دکمه‌های زیر استفاده کن:\n"
+    "• منو: نمایش محصولات با نام، قیمت و عکس\n"
+    "• سفارش: ثبت سفارش و دریافت آدرس/شماره\n"
+    "• کیف پول: مشاهده/شارژ، کش‌بک {cb}% بعد هر خرید\n"
+    "• بازی: سرگرمی\n"
+    "• ارتباط با ما: پیام به ادمین\n"
+    "• راهنما: دستورها"
+).format(cb=DEFAULT_CASHBACK)
+
+MAIN_KEYBOARD = [
+    ["🍬 منو", "🧾 سفارش"],
+    ["👛 کیف پول", "🎮 بازی"],
+    ["📞 ارتباط با ما", "ℹ️ راهنما"],
+]
