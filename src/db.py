@@ -77,20 +77,19 @@ CREATE TABLE IF NOT EXISTS order_items(
   unit_price NUMERIC NOT NULL,
   line_total NUMERIC GENERATED ALWAYS AS (qty * unit_price) STORED
 );
-
 CREATE INDEX IF NOT EXISTS ix_order_items_order ON order_items(order_id);
 
 -- تراکنش‌های کیف پول
 CREATE TABLE IF NOT EXISTS wallet_transactions(
   id         BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  kind       TEXT NOT NULL, -- topup|order|refund|cashback|adjust
-  amount     NUMERIC NOT NULL, -- + افزایش، - کاهش
+  kind       TEXT NOT NULL, -- topup|order|refund|cashback|adjust|direct
+  amount     NUMERIC NOT NULL,
   meta       JSONB DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- به‌روزرسانی خودکار موجودی
+-- تریگر بروزرسانی موجودی
 CREATE OR REPLACE FUNCTION fn_apply_wallet_tx()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -104,7 +103,7 @@ CREATE TRIGGER trg_apply_wallet_tx
 AFTER INSERT ON wallet_transactions
 FOR EACH ROW EXECUTE FUNCTION fn_apply_wallet_tx();
 
--- محاسبه مجموع سفارش
+-- مجموع سفارش
 CREATE OR REPLACE FUNCTION fn_recalc_total(p_id BIGINT)
 RETURNS VOID AS $$
 BEGIN
@@ -113,7 +112,7 @@ BEGIN
   WHERE o.id = p_id;
 END; $$ LANGUAGE plpgsql;
 
--- اعمال کش‌بک زمانی که برای اولین بار paid شد
+-- کش‌بک پس از PAID شدن
 CREATE OR REPLACE FUNCTION fn_apply_cashback()
 RETURNS TRIGGER AS $$
 DECLARE percent NUMERIC := 0; amount NUMERIC := 0;
@@ -135,30 +134,27 @@ AFTER UPDATE ON orders
 FOR EACH ROW EXECUTE FUNCTION fn_apply_cashback();
 """
 
-# یک‌بارۀ «تمیزسازی» محصولات تکثاریِ فعال + ساخت ایندکس یکتا
+# پاکسازی تکثاری‌های فعال و ایندکس یکتا روی نام
 DEDUP_AND_INDEX_SQL = """
 DO $$
 BEGIN
-  -- اگر قبلاً ایندکس یکتا ساخته شده، کاری نکن
   IF NOT EXISTS (
     SELECT 1 FROM pg_indexes
-    WHERE schemaname = ANY(current_schemas(true))
-      AND indexname = 'ux_products_name_active'
+     WHERE schemaname = ANY(current_schemas(true))
+       AND indexname = 'ux_products_name_active'
   ) THEN
-    -- اول: هر نام تکراری فعال => فقط کمترین id فعال بماند
     WITH d AS (
       SELECT LOWER(name) ln, MIN(id) keep_id
       FROM products WHERE is_active = TRUE
       GROUP BY LOWER(name)
     )
     UPDATE products p
-    SET is_active = FALSE
-    FROM d
-    WHERE p.is_active = TRUE
-      AND LOWER(p.name) = d.ln
-      AND p.id <> d.keep_id;
+       SET is_active = FALSE
+      FROM d
+     WHERE p.is_active = TRUE
+       AND LOWER(p.name) = d.ln
+       AND p.id <> d.keep_id;
 
-    -- سپس: ایندکس یکتا
     EXECUTE 'CREATE UNIQUE INDEX ux_products_name_active ON products (LOWER(name)) WHERE is_active = TRUE';
   END IF;
 END $$;
@@ -169,7 +165,7 @@ def init_db():
     _exec(SCHEMA_SQL, {"cashback": DEFAULT_CASHBACK_PERCENT})
     _exec(DEDUP_AND_INDEX_SQL)
 
-# ====== APIهای کمکی ======
+# ============ API ============
 
 def upsert_user(tg_id: int, name: str):
     sql = """
@@ -184,20 +180,30 @@ def upsert_user(tg_id: int, name: str):
             return cur.fetchone()
 
 def set_user_profile(tg_id: int, name=None, phone=None, address=None):
-    sql = """
-    UPDATE users SET
-      name    = COALESCE(%s,name),
-      phone   = COALESCE(%s,phone),
-      address = COALESCE(%s,address)
-    WHERE telegram_id=%s
-    """
-    _exec(sql, (name, phone, address, tg_id))
+    _exec(
+        "UPDATE users SET name=COALESCE(%s,name), phone=COALESCE(%s,phone), address=COALESCE(%s,address) WHERE telegram_id=%s",
+        (name, phone, address, tg_id),
+    )
 
 def get_user(tg_id: int):
     return _fetch("SELECT * FROM users WHERE telegram_id=%s", (tg_id,), one=True)
 
-def list_products():
-    return _fetch("SELECT id,name,price,photo_file_id,description FROM products WHERE is_active=TRUE ORDER BY id DESC")
+def wallet(tg_id: int):
+    row = _fetch("SELECT balance FROM users WHERE telegram_id=%s", (tg_id,), one=True)
+    return row["balance"] if row else 0
+
+# محصولات
+def list_products(limit=None, offset=0):
+    q = "SELECT id,name,price,photo_file_id,description FROM products WHERE is_active=TRUE ORDER BY id DESC"
+    if limit:
+        q += f" LIMIT {int(limit)} OFFSET {int(offset)}"
+    return _fetch(q)
+
+def count_products():
+    return _fetch("SELECT COUNT(*) cnt FROM products WHERE is_active=TRUE", one=True)["cnt"]
+
+def get_product(pid: int):
+    return _fetch("SELECT id,name,price,photo_file_id,description FROM products WHERE id=%s AND is_active=TRUE", (pid,), one=True)
 
 def add_product(name, price, photo_id=None, description=None):
     _exec(
@@ -205,6 +211,7 @@ def add_product(name, price, photo_id=None, description=None):
         (name, price, photo_id, description),
     )
 
+# سفارش‌ها
 def open_draft_order(user_id: int):
     row = _fetch("SELECT id FROM orders WHERE user_id=%s AND status='draft' ORDER BY id DESC LIMIT 1", (user_id,), one=True)
     if row: return row["id"]
@@ -213,26 +220,56 @@ def open_draft_order(user_id: int):
             cur.execute("INSERT INTO orders(user_id,status) VALUES(%s,'draft') RETURNING id", (user_id,))
             return cur.fetchone()[0]
 
-def add_item(order_id: int, product_id: int, qty: int, unit_price: float):
-    _exec("INSERT INTO order_items(order_id,product_id,qty,unit_price) VALUES(%s,%s,%s,%s)", (order_id, product_id, qty, unit_price))
+def add_or_increment_item(order_id: int, product_id: int, unit_price: float, inc: int = 1):
+    row = _fetch("SELECT id,qty FROM order_items WHERE order_id=%s AND product_id=%s", (order_id, product_id), one=True)
+    if row:
+        new_qty = max(1, row["qty"] + inc)
+        _exec("UPDATE order_items SET qty=%s WHERE id=%s", (new_qty, row["id"]))
+    else:
+        _exec("INSERT INTO order_items(order_id,product_id,qty,unit_price) VALUES(%s,%s,%s,%s)",
+              (order_id, product_id, max(1, inc), unit_price))
     _exec("SELECT fn_recalc_total(%s)", (order_id,))
+
+def get_order_details(order_id: int):
+    items = _fetch("""
+      SELECT oi.id, oi.product_id, p.name, oi.qty, oi.unit_price, oi.line_total
+      FROM order_items oi
+      JOIN products p ON p.id=oi.product_id
+      WHERE oi.order_id=%s
+      ORDER BY oi.id
+    """, (order_id,))
+    order = _fetch("SELECT id,status,total_amount,cashback_amount FROM orders WHERE id=%s", (order_id,), one=True)
+    return order, items
+
+def summarize_order(order_id: int):
+    order, items = get_order_details(order_id)
+    if not order: return "سبد خالی است.", 0
+    lines = []
+    for it in items:
+        lines.append(f"• {it['name']} ×{it['qty']} — {int(it['line_total'])} تومان")
+    total = int(order["total_amount"])
+    txt = "🧾 <b>فاکتور</b>\n" + "\n".join(lines or ["(خالی)"]) + f"\n— — —\nجمع کل: <b>{total}</b> تومان"
+    return txt, total
 
 def submit_order(order_id: int):
     _exec("UPDATE orders SET status='submitted' WHERE id=%s", (order_id,))
 
-def pay_order(order_id: int, user_id: int):
-    # برداشت از کیف‌پول (به اندازه‌ی مبلغ)
-    row = _fetch("SELECT total_amount FROM orders WHERE id=%s", (order_id,), one=True)
-    amount = row["total_amount"] if row else 0
+def can_pay_with_wallet(user_id: int, order_id: int):
+    bal = _fetch("SELECT balance FROM users WHERE id=%s", (user_id,), one=True)["balance"]
+    total = _fetch("SELECT total_amount FROM orders WHERE id=%s", (order_id,), one=True)["total_amount"]
+    return bal >= total, int(bal), int(total)
+
+def pay_with_wallet(user_id: int, order_id: int):
+    ok, bal, total = can_pay_with_wallet(user_id, order_id)
+    if not ok:
+        return False, bal, total
     _exec("INSERT INTO wallet_transactions(user_id,kind,amount,meta) VALUES(%s,'order',%s,jsonb_build_object('order_id',%s))",
-          (user_id, -amount, order_id))
+          (user_id, -total, order_id))
     _exec("UPDATE orders SET status='paid' WHERE id=%s", (order_id,))
+    return True, bal-total, total
 
-def wallet(tg_id: int):
-    return _fetch("SELECT balance FROM users WHERE telegram_id=%s", (tg_id,), one=True)["balance"]
-
-def topup_wallet(tg_id: int, amount: float, ref: str):
-    u = get_user(tg_id)
-    if not u: return
-    _exec("INSERT INTO wallet_transactions(user_id,kind,amount,meta) VALUES(%s,'topup',%s,jsonb_build_object('ref',%s))",
-          (u["id"], amount, ref))
+def mark_paid_direct(user_id: int, order_id: int, ref: str):
+    # بدون دست‌کاری موجودی؛ فقط ثبت ref برای گزارش/پیگیری
+    _exec("UPDATE orders SET status='paid' WHERE id=%s", (order_id,))
+    _exec("INSERT INTO wallet_transactions(user_id,kind,amount,meta) VALUES(%s,'direct',0,jsonb_build_object('order_id',%s,'ref',%s))",
+          (user_id, order_id, ref))
