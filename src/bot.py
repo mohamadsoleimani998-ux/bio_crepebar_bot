@@ -1,21 +1,19 @@
 import os
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application
+from telegram.ext import Application, Defaults
 
 from .base import log
 from .handlers import build_handlers
 from . import db
 
-
 # ---- ENV ----
-BOT_TOKEN       = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-PUBLIC_URL      = (os.environ.get("PUBLIC_URL")
-                   or os.environ.get("WEBHOOK_URL")
-                   or os.environ.get("WEBHOOK_BASE"))
-WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
-PORT            = int(os.environ.get("PORT", "10000"))
-
+BOT_TOKEN      = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+PUBLIC_URL     = (os.environ.get("PUBLIC_URL")
+                  or os.environ.get("WEBHOOK_URL")
+                  or os.environ.get("WEBHOOK_BASE"))
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
+PORT           = int(os.environ.get("PORT", "10000"))
 
 def main() -> None:
     if not BOT_TOKEN:
@@ -26,11 +24,12 @@ def main() -> None:
     db.init_db()
     log.info("init_db() done.")
 
-    # 2) Build application with parse_mode
+    # 2) Build application + defaults(parse_mode=HTML)
+    defaults = Defaults(parse_mode=ParseMode.HTML)
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .parse_mode(ParseMode.HTML)  # ← اینجا اضافه شد
+        .defaults(defaults)     # ← به‌جای parse_mode(...)
         .build()
     )
 
@@ -41,7 +40,6 @@ def main() -> None:
     if PUBLIC_URL:
         webhook_url = PUBLIC_URL.rstrip("/") + "/"
         log.info("Starting in WEBHOOK mode | url=%s | port=%s", webhook_url, PORT)
-
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -57,7 +55,6 @@ def main() -> None:
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=True,
         )
-
 
 if __name__ == "__main__":
     main()
