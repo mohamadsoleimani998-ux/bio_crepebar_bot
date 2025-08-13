@@ -1,34 +1,48 @@
-from telegram.ext import Application, Defaults
-from telegram.constants import ParseMode
-from .base import TOKEN, PUBLIC_URL, WEBHOOK_SECRET, PORT, log
-from .handlers import build_handlers
+import asyncio
+import os
+
+from telegram.ext import Application
+from .base import log, BOT_TOKEN, WEBHOOK_SECRET, PORT, BASE_URL
 from . import db
+from .handlers import build_handlers
+
+def ensure_envs():
+    missing = []
+    for key in ("BOT_TOKEN","DATABASE_URL"):
+        if not os.environ.get(key) and key=="DATABASE_URL" and not os.environ.get("DB_URL"):
+            missing.append(key)
+        elif not os.environ.get(key):
+            missing.append(key)
+    if missing:
+        raise RuntimeError(f"Missing envs: {', '.join(missing)}")
+    if not BASE_URL:
+        raise RuntimeError("BASE_URL/RENDER_EXTERNAL_URL is required for webhooks")
 
 def main():
-    if not TOKEN:
-        raise RuntimeError("TOKEN env is missing (TELEGRAM_TOKEN / BOT_TOKEN).")
-
+    ensure_envs()
     db.init_db()
 
-    app = Application.builder().token(TOKEN).defaults(Defaults(parse_mode=ParseMode.HTML)).build()
+    app = Application.builder().token(BOT_TOKEN).build()
 
+    # handlers
     for h in build_handlers():
         app.add_handler(h)
 
-    if PUBLIC_URL:
-        url = PUBLIC_URL.rstrip("/") + f"/{TOKEN}"
-        log.info("Running webhook at %s", url)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=TOKEN,
-            webhook_url=url,
-            secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True,
-        )
-    else:
-        log.warning("PUBLIC_URL not set -> running polling")
-        app.run_polling(drop_pending_updates=True)
+    # webhook
+    path = f"/tg/{WEBHOOK_SECRET}"
+    url = BASE_URL.rstrip("/") + path
+    log.info("Setting webhook to %s", url)
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        secret_token=WEBHOOK_SECRET,
+        webhook_url=url,
+    )
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        log.exception("FATAL: bot crashed during startup")
+        raise
