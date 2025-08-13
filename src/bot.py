@@ -21,26 +21,27 @@ def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN env is missing.")
 
-    # 1) DB init (idempotent)
+    # 1) DB init
     log.info("init_db() running...")
     db.init_db()
     log.info("init_db() done.")
 
-    # 2) Build application
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    # PTB v21: parse_mode در بیلدر نیست؛ این‌طوری ست کن
-    app.bot.parse_mode = ParseMode.HTML
+    # 2) Build application with parse_mode
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .parse_mode(ParseMode.HTML)  # ← اینجا اضافه شد
+        .build()
+    )
 
     # 3) Handlers
     app.add_handlers(build_handlers())
 
-    # 4) Run (Webhook if PUBLIC_URL provided, else polling)
+    # 4) Run
     if PUBLIC_URL:
         webhook_url = PUBLIC_URL.rstrip("/") + "/"
         log.info("Starting in WEBHOOK mode | url=%s | port=%s", webhook_url, PORT)
 
-        # متدهای run_webhook همه‌چیز را هندل می‌کنند (ست وبهوک + استارت)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
