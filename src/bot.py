@@ -1,29 +1,38 @@
 import os
-from telegram.ext import ApplicationBuilder
-from .base import BOT_TOKEN, PUBLIC_URL, WEBHOOK_SECRET, tg_defaults, log
-from .handlers import build_handlers
-from . import db_sqlite as db
+from telegram.ext import Application, Defaults
+from telegram.constants import ParseMode
 
-PORT = int(os.environ.get("PORT", "10000"))
+from .base import BOT_TOKEN, PUBLIC_URL, WEBHOOK_SECRET, log
+from . import db
+from .handlers import build_handlers
 
 def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is missing")
+
     # DB
     db.init_db()
+    db.ensure_categories()
 
-    # BOT
-    app = ApplicationBuilder().token(BOT_TOKEN).defaults(tg_defaults).build()
+    # Bot app
+    app = Application.builder()\
+        .token(BOT_TOKEN)\
+        .defaults(Defaults(parse_mode=ParseMode.HTML))\
+        .build()
 
-    # Handlers
+    # handlers
     for h in build_handlers():
         app.add_handler(h)
 
-    # webhook for PTB 21.x (بدون url_path)
-    log.info("Starting webhook on 0.0.0.0:%d -> %s", PORT, PUBLIC_URL)
+    # webhook
+    # PTB v21: run_webhook(signature=..., secret_token=...)
+    # اگر PUBLIC_URL ست شده اجرا با وبهوک
+    log.info("Starting with webhook...")
     app.run_webhook(
         listen="0.0.0.0",
-        port=PORT,
+        port=int(os.environ.get("PORT", "10000")),
         secret_token=WEBHOOK_SECRET,
-        webhook_url=PUBLIC_URL,   # مثلا https://bio-crepebar-bot.onrender.com/
+        webhook_url=PUBLIC_URL,
         drop_pending_updates=True,
     )
 
