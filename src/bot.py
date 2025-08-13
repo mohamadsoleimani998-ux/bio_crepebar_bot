@@ -1,4 +1,3 @@
-import asyncio
 from telegram.ext import Application, Defaults
 from telegram.constants import ParseMode
 from .base import TOKEN, PUBLIC_URL, WEBHOOK_SECRET, PORT, log
@@ -6,7 +5,11 @@ from .handlers import build_handlers
 from . import db
 
 def main():
-    db.init_db()  # سریع و ایمن
+    if not TOKEN:
+        raise RuntimeError("TOKEN env is missing (TELEGRAM_TOKEN / BOT_TOKEN).")
+
+    # ساخت/بررسی اسکیما
+    db.init_db()
 
     app = Application.builder().token(TOKEN).defaults(Defaults(parse_mode=ParseMode.HTML)).build()
 
@@ -15,8 +18,7 @@ def main():
 
     if PUBLIC_URL:
         url = PUBLIC_URL.rstrip("/") + f"/{TOKEN}"
-        log.info("Webhook at %s", url)
-        # NOTE: run_webhook همه چیز را مدیریت می‌کند (init/start/idle/shutdown)
+        log.info("Running webhook at %s", url)
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -26,7 +28,7 @@ def main():
             drop_pending_updates=True,
         )
     else:
-        log.warning("PUBLIC_URL not set -> fallback to polling")
+        log.warning("PUBLIC_URL not set -> running polling")
         app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
