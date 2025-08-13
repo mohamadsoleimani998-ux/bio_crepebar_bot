@@ -12,30 +12,38 @@ from .base import (
 from . import db
 import re
 
-# --- States ---
+# ---------- States ----------
 ADD_PRODUCT_STATE = {}
 REGISTER_STATE = {}
 
-# --- Helpers ---
+# ---------- Keyboards ----------
 def _main_kb():
     return ReplyKeyboardMarkup(MAIN_KEYBOARD, resize_keyboard=True)
 
-# نرمال‌سازی: اموجی/سیمبل‌ها حذف، فاصله‌ها ساده
-_EMOJI_RE = re.compile(r"[^\w\s\u0600-\u06FF]", flags=re.UNICODE)  # حروف/اعداد فارسی و لاتین و فاصله
-_SPACE_RE = re.compile(r"\s+")
+# ---------- Normalizer ----------
+# حذف ZWJ/RTL marks/اموجی/سایر سیمبل‌ها؛ نگه‌داشتن فقط حروف و اعداد فارسی/لاتین و فاصله
+ZWJ_RTL = "".join(chr(c) for c in [0x200C, 0x200D, 0x200F, 0x061C])
+_EMOJI_SYMBOLS = re.compile(fr"[{re.escape(ZWJ_RTL)}\u2066-\u2069]|[^\w\s\u0600-\u06FF]", re.UNICODE)
+_MULTI_SPACE = re.compile(r"\s+")
+# یکسان‌سازی ی و ك/كاف عربی، هٔ… برای مقایسه مطمئن
+TRANSLATE = str.maketrans({
+    "ي": "ی", "ى": "ی", "ك": "ک",
+    "ۀ": "ه", "ة": "ه",
+})
 
 def norm(txt: str) -> str:
     if not txt:
         return ""
-    t = _EMOJI_RE.sub(" ", txt)          # هر چیزی غیر از حرف/عدد/فاصله را فضای خالی می‌کنیم
-    t = _SPACE_RE.sub(" ", t).strip()
-    return t
+    t = txt.translate(TRANSLATE)
+    t = _EMOJI_SYMBOLS.sub(" ", t)
+    t = _MULTI_SPACE.sub(" ", t).strip()
+    return t.casefold()
 
-def has(txt: str, *keywords: str) -> bool:
+def has_any(txt: str, *keywords: str) -> bool:
     nt = norm(txt)
     return any(k in nt for k in keywords)
 
-# --- Commands ---
+# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     db.upsert_user(u.id, u.full_name or u.username or str(u.id))
@@ -45,21 +53,45 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "دستورات:\n"
         "/start – شروع\n"
+        "/menu – نمایش منو\n"
         "/addproduct – اضافه‌کردن محصول (ادمین)\n"
         "/register – ثبت‌نام/ویرایش اطلاعات\n"
         "/wallet – موجودی و شارژ کیف پول\n"
     )
 
-# ---------- Register ----------
+async def menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_menu(update)
+
+# ---------- Register flow ----------
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     REGISTER_STATE[update.effective_user.id] = "NAME"
     await update.message.reply_text("نام خود را بفرستید:")
+
+# ---------- Helpers ----------
+async def show_menu(update: Update):
+    try:
+        prods = db.list_products()
+        if not prods:
+            await update.message.reply_text("فعلاً محصولی ثبت نشده.")
+            return
+        for p in prods:
+            cap = f"🍩 <b>{p['name']}</b>\nقیمت: {p['price']:,} تومان"
+            if p.get("description"):
+                cap += f"\n— {p['description']}"
+            if p.get("photo_file_id"):
+                await update.message.reply_photo(p["photo_file_id"], caption=cap)
+            else:
+                await update.message.reply_text(cap)
+    except Exception as e:
+        log.exception("menu error: %s", e)
+        await update.message.reply_text("❌ خطای غیرمنتظره در نمایش منو.")
 
 # ---------- Routers ----------
 async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     raw = update.message.text or ""
-    txt = norm(raw)
+    n = norm(raw)
+    log.info("TEXT IN: raw='%s' | norm='%s' | uid=%s", raw, n, u.id)
 
     # ثبت‌نام
     if REGISTER_STATE.get(u.id) == "NAME":
@@ -80,27 +112,16 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ ثبت اطلاعات انجام شد.", reply_markup=_main_kb())
         return
 
-    # کیبورد اصلی
-    if has(raw, "منو", "menu"):
-        prods = db.list_products()
-        if not prods:
-            await update.message.reply_text("فعلاً محصولی ثبت نشده.")
-            return
-        for p in prods:
-            cap = f"🍩 <b>{p['name']}</b>\nقیمت: {p['price']:,} تومان"
-            if p.get("description"):
-                cap += f"\n— {p['description']}"
-            if p.get("photo_file_id"):
-                await update.message.reply_photo(p["photo_file_id"], caption=cap)
-            else:
-                await update.message.reply_text(cap)
+    # دکمه‌ها (با و بدون اموجی/جا‌به‌جایی)
+    if has_any(raw, "منو", "menu"):
+        await show_menu(update)
         return
 
-    if has(raw, "سفارش", "order"):
+    if has_any(raw, "سفارش", "order"):
         await update.message.reply_text("نام محصول و تعداد را بنویس (مثال: «اسپرسو x2»). (دموی ساده)")
         return
 
-    if has(raw, "کیف پول", "کیف", "wallet"):
+    if has_any(raw, "کیف پول", "کیف", "wallet"):
         user = db.get_user_by_tg(u.id)
         bal = user["wallet"] if user else 0
         kb = InlineKeyboardMarkup([[
@@ -112,20 +133,21 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if has(raw, "بازی", "game"):
+    if has_any(raw, "بازی", "game"):
         await update.message.reply_text("🎲 به‌زودی…")
         return
 
-    if has(raw, "ارتباط با ما", "ارتباط", "contact"):
+    if has_any(raw, "ارتباط با ما", "ارتباط", "contact"):
         await update.message.reply_text("پیامت را بنویس؛ برای ادمین ارسال می‌شود.")
         return
 
-    if has(raw, "راهنما", "help"):
+    if has_any(raw, "راهنما", "help"):
         await help_cmd(update, context)
         return
 
     # --- جریان ادمین Add Product ---
-    if ADD_PRODUCT_STATE.get(u.id, {}).get("await") == "PRICE":
+    st = ADD_PRODUCT_STATE.get(u.id)
+    if st and st.get("await") == "PRICE":
         try:
             numbers = "".join(ch for ch in raw if ch.isdigit())
             price = int(numbers)
@@ -136,10 +158,10 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("قیمت نامعتبر است. فقط عدد بفرست.")
         return
 
-    if ADD_PRODUCT_STATE.get(u.id, {}).get("await") == "DESC":
+    if st and st.get("await") == "DESC":
         try:
             desc = raw.strip()
-            if has(desc, "بدون توضیحات"):
+            if has_any(desc, "بدون توضیحات"):
                 desc = None
             st = ADD_PRODUCT_STATE.pop(u.id, {})
             row = db.add_product(st.get("name"), st.get("price"), st.get("photo"), desc)
@@ -169,7 +191,7 @@ async def addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ADD_PRODUCT_STATE[update.effective_user.id] = {"await": "NAME"}
     await update.message.reply_text("نام محصول را بفرست:")
 
-# First-step name catch for addproduct
+# First-step name catcher for addproduct
 async def any_text_first(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     st = ADD_PRODUCT_STATE.get(u.id)
@@ -206,12 +228,13 @@ def build_handlers():
     return [
         CommandHandler("start", start),
         CommandHandler("help", help_cmd),
+        CommandHandler("menu", menu_cmd),      # میانبر منو
         CommandHandler("register", register),
         CommandHandler("addproduct", addproduct),
         CommandHandler("wallet", text_router),
         CommandHandler("credit", admin_add_credit),
-        CallbackQueryHandler(on_callback),
 
+        CallbackQueryHandler(on_callback),
         MessageHandler(filters.PHOTO, photo_router),
         MessageHandler(filters.TEXT & ~filters.COMMAND, any_text_first),
     ]
