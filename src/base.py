@@ -1,34 +1,26 @@
 import logging
 import os
-from dotenv import load_dotenv
+from telegram.constants import ParseMode
+from telegram.ext import Defaults
 
-load_dotenv()
-
-# ---- logging
+# ---------- Logging ----------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=os.environ.get("LOG_LEVEL", "INFO"),
 )
 log = logging.getLogger("crepebar")
 
-# ---- ENV
-BOT_TOKEN        = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-DATABASE_URL     = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
-PUBLIC_URL       = (os.getenv("PUBLIC_URL") or os.getenv("WEBHOOK_BASE") or "").rstrip("/")
-WEBHOOK_SECRET   = os.getenv("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
-CASHBACK_PERCENT = float(os.getenv("CASHBACK_PERCENT", "3") or 0)
+# ---------- ENV ----------
+BOT_TOKEN       = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+PUBLIC_URL      = os.environ.get("PUBLIC_URL") or os.environ.get("WEBHOOK_URL")
+WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET", "telegram-secret")
+ADMIN_IDS       = {int(x) for x in (os.environ.get("ADMIN_IDS") or "").replace(",", " ").split() if x.isdigit()}
+CASHBACK_PERCENT = int(os.environ.get("CASHBACK_PERCENT", "3"))
 
-# admin ids: "111,222"
-_admin_raw = os.getenv("ADMIN_IDS", "").strip()
-ADMIN_IDS = {int(x) for x in _admin_raw.replace(" ", "").split(",") if x.isdigit()}
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env is missing")
+if not PUBLIC_URL:
+    raise RuntimeError("PUBLIC_URL env (your Render URL) is missing")
 
-def tman(amount) -> str:
-    """Format TOMAN with thousands separator."""
-    try:
-        v = int(round(float(amount)))
-    except Exception:
-        v = 0
-    return f"{v:,} تومان"
-
-def is_admin(tg_id: int) -> bool:
-    return tg_id in ADMIN_IDS
+# Defaults: همه پیام‌ها HTML
+tg_defaults = Defaults(parse_mode=ParseMode.HTML)
