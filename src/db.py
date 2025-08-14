@@ -1,5 +1,5 @@
 import psycopg2
-from psycopg2.extras import DictCursor
+from psycopg2.extras import DictCursor, Json
 from .base import log, DATABASE_URL
 
 # --------------------------
@@ -159,20 +159,38 @@ FOR EACH ROW EXECUTE FUNCTION fn_apply_cashback();
 
 -- ========= topup requests =========
 CREATE TABLE IF NOT EXISTS topup_requests (
-  req_id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  user_id     BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-  amount      NUMERIC NOT NULL,
-  status      TEXT NOT NULL DEFAULT 'pending', -- pending | approved | rejected
-  user_msg_id BIGINT,
+  req_id       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  user_id      BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  amount       NUMERIC NOT NULL,
+  status       TEXT NOT NULL DEFAULT 'pending', -- pending | approved | rejected
+  user_msg_id  BIGINT,
   admin_msg_id BIGINT,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+"""
+
+# در صورت تفاوت نام ستون‌ها، مایگریشن سبک
+MIGRATE_SQL = r"""
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name='products' AND column_name='id'
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+     WHERE table_name='products' AND column_name='product_id'
+  ) THEN
+    EXECUTE 'ALTER TABLE products RENAME COLUMN id TO product_id';
+  END IF;
+END $$;
 """
 
 # --------------------------
 def init_db():
     log.info("init_db() running...")
     _exec(SCHEMA_SQL)
+    _exec(MIGRATE_SQL)
     # seed categories (idempotent)
     seed = [
         ("espresso", "اسپرسو بار گرم و سرد", 100),
@@ -239,6 +257,15 @@ def list_products_by_category(cat_id: int, page: int=1, page_size: int=6):
              LIMIT %s OFFSET %s
         """, (cat_id, page_size, off))
         return cur.fetchall(), total
+
+def get_product_by_id(pid: int):
+    with _conn() as cn, cn.cursor(cursor_factory=DictCursor) as cur:
+        cur.execute("""
+            SELECT product_id AS id, name, price, description, photo_file_id, category_id, is_active
+              FROM products
+             WHERE product_id=%s
+        """, (pid,))
+        return cur.fetchone()
 
 def add_product(cat_id: int, name: str, price: float, description: str|None, photo_file_id: str|None):
     with _conn() as cn, cn.cursor() as cur:
@@ -315,7 +342,7 @@ def mark_order_paid(order_id: int):
 def add_wallet_tx(user_id: int, kind: str, amount: float, meta: dict):
     with _conn() as cn, cn.cursor() as cur:
         cur.execute("""INSERT INTO wallet_transactions(user_id,kind,amount,meta) VALUES(%s,%s,%s,%s)""",
-                    (user_id, kind, amount, psycopg2.extras.Json(meta)))
+                    (user_id, kind, amount, Json(meta)))
 
 # Topup
 def create_topup_request(user_id: int, amount: float, user_msg_id: int) -> int:
