@@ -1,10 +1,4 @@
-# src/base.py
 # -*- coding: utf-8 -*-
-"""
-تنظیمات پایه، لاگینگ و خواندن متغیرهای محیطی پروژه بات فروشگاهی.
-با Render/Neon هماهنگ است.
-"""
-
 from __future__ import annotations
 
 import os
@@ -12,31 +6,19 @@ import logging
 from decimal import Decimal
 from typing import Iterable, Set
 
-# ---------------------------
-# Logging
-# ---------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("crepebar")
 
-
-# ---------------------------
-# Helpers
-# ---------------------------
 def _env(name: str, default=None, required: bool = False):
-    """خواندن متغیر محیطی با هندل‌کردن مقدار پیش‌فرض/اجباری بودن."""
     val = os.environ.get(name, default)
     if required and (val is None or str(val).strip() == ""):
-        raise RuntimeError(f"{name} is not set in environment variables")
+        raise RuntimeError(f"{name} is not set")
     return val
 
-
 def _parse_admin_ids(val: str | None) -> Set[int]:
-    """
-    ورودی مثل '123,456  789' → {123, 456, 789}
-    """
     if not val:
         return set()
     parts: Iterable[str] = [p.strip() for p in val.replace("؛", ",").replace(" ", ",").split(",")]
@@ -47,59 +29,56 @@ def _parse_admin_ids(val: str | None) -> Set[int]:
         try:
             out.add(int(p))
         except ValueError:
-            log.warning("ADMIN_IDS contains a non-numeric value: %r", p)
+            log.warning("ADMIN_IDS contains non-numeric value: %r", p)
     return out
 
-
-def toman(n: Decimal | int | float) -> str:
-    """
-    قالب‌بندی عدد به تومان با جداکننده هزارگان.
-    مثال: 125000 → '125,000 تومان'
-    """
+def fmt_money(n: int | float | Decimal) -> str:
     try:
-        num = Decimal(n)
+        v = int(Decimal(n))
+        return f"{v:,} تومان"
     except Exception:
         return f"{n} تومان"
-    q = f"{int(num):,}"
-    return f"{q} تومان"
 
+def is_admin(tg_id: int) -> bool:
+    return tg_id in ADMIN_IDS
 
-# ---------------------------
-# Environment & constants
-# ---------------------------
-
-# دیتابیس (برای db.py لازم است)
+# ---------- ENV ----------
 DATABASE_URL: str = _env("DATABASE_URL", required=True)
 
-# توکن بات
-# امکان سازگاری با هر دو نام رایج:
 BOT_TOKEN: str = _env("BOT_TOKEN", default=_env("TELEGRAM_TOKEN"), required=True)
 
-# آدرس عمومی سرویس (برای وبهوک)
-PUBLIC_URL: str = _env("PUBLIC_URL", default=_env("WEBHOOK_BASE"))
-if PUBLIC_URL:
-    PUBLIC_URL = PUBLIC_URL.rstrip("/")
+PUBLIC_URL: str = _env("PUBLIC_URL", default=_env("WEBHOOK_BASE", default="")).rstrip("/")
 
-# وبهوک (اختیاری؛ اگر خالی باشد، از Polling استفاده می‌شود)
 WEBHOOK_SECRET: str = _env("WEBHOOK_SECRET", default="T3legramWebhookSecret_2025")
 WEBHOOK_PATH: str = _env("WEBHOOK_PATH", default="/telegram-webhook")
-WEBHOOK_URL: str | None = _env("WEBHOOK_URL", default=None)
-# اگر WEBHOOK_URL مشخص نشده ولی PUBLIC_URL هست، خودمان می‌سازیم:
-if not WEBHOOK_URL and PUBLIC_URL:
-    WEBHOOK_URL = f"{PUBLIC_URL}{WEBHOOK_PATH}"
+WEBHOOK_URL: str | None = _env("WEBHOOK_URL", default=None) or (f"{PUBLIC_URL}{WEBHOOK_PATH}" if PUBLIC_URL else None)
 
-# ادمین‌ها
 ADMIN_IDS = _parse_admin_ids(_env("ADMIN_IDS", default=""))
 
-# درصد کش‌بک
 try:
     CASHBACK_PERCENT: int = int(str(_env("CASHBACK_PERCENT", default="3")).strip())
 except Exception:
     CASHBACK_PERCENT = 3
 
-# واحد پول
-CURRENCY = "تومان"
+# کارت به کارت (اختیاری – برای پیام راهنما)
+CARD_PAN  = _env("CARD_PAN",  default="****-****-****-****")
+CARD_NAME = _env("CARD_NAME", default="دارنده کارت")
+CARD_NOTE = _env("CARD_NOTE", default="پس از واریز، رسید را همین‌جا ارسال کنید.")
 
-# سایر تنظیمات عمومی ربات
-PAGE_SIZE = 6  # تعداد آیتم منو در هر صفحه
-BRAND_NAME = _env("BRAND_NAME", default="کافه")
+CURRENCY = "تومان"
+PAGE_SIZE = 6
+
+# دسته‌های منو (slug, title)
+CATEGORIES: list[tuple[str, str]] = [
+    ("espresso", "اسپرسو بار گرم و سرد"),
+    ("tea", "چای و دمنوش"),
+    ("mixhot", "ترکیبی گرم"),
+    ("mocktail", "موکتل ها"),
+    ("sky", "اسمونی ها"),
+    ("cold", "خنک"),
+    ("dami", "دمی"),
+    ("crepe", "کرپ"),
+    ("pancake", "پنکیک"),
+    ("diet", "رژیمی ها"),
+    ("matcha", "ماچا بار"),
+]
