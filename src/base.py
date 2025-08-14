@@ -1,54 +1,43 @@
+# src/base.py
 import os
 import logging
 
-# ------------------ ENV ------------------
-TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or None
-PORT = int(os.getenv("PORT", "8080"))
-
-DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
-
-# ادمین‌ها: لیست عددی
-def _parse_admin_ids(v: str | None):
-    if not v:
-        return []
-    out = []
-    for p in v.replace(";", ",").split(","):
-        p = p.strip()
-        if not p:
-            continue
-        try:
-            out.append(int(p))
-        except Exception:
-            pass
-    return out
-
-ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS"))
-
-# واحد پول
-CURRENCY = "تومان"
-
-# ------------------ LOG ------------------
+# --- Logging ---
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | crepebar | %(message)s"
 )
 log = logging.getLogger("crepebar")
 
-# ------------------ Helpers ------------------
+# --- ENV / Config ---
+BOT_TOKEN     = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+PUBLIC_URL    = os.getenv("PUBLIC_URL", "").rstrip("/")
+DATABASE_URL  = os.getenv("DATABASE_URL")
+WEBHOOK_SECRET= os.getenv("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
+PORT          = int(os.getenv("PORT", "8000"))
+
+# Admins (comma/space separated)
+ADMIN_IDS = []
+for part in (os.getenv("ADMIN_IDS") or "").replace(",", " ").split():
+    if part.strip().isdigit():
+        ADMIN_IDS.append(int(part.strip()))
+
 def is_admin(tg_id: int) -> bool:
     return int(tg_id) in ADMIN_IDS
 
-def fmt_money(amount: float | int) -> str:
+# Money / currency
+CURRENCY = "تومان"
+def fmt_money(x: float|int) -> str:
     try:
-        n = int(round(float(amount)))
+        v = int(round(float(x)))
     except Exception:
-        n = 0
-    s = f"{n:,}".replace(",", "،")
-    return f"{s} {CURRENCY}"
+        v = 0
+    return f"{v:,} {CURRENCY}".replace(",", "٬")
 
-# کارت به کارت (نمایش در صفحه شارژ)
-CARD_PAN  = os.getenv("CARD_PAN", "---- ---- ---- ----")
-CARD_NAME = os.getenv("CARD_NAME", "صاحب حساب")
-CARD_NOTE = os.getenv("CARD_NOTE", "لطفاً بعد از واریز، رسید را ارسال کنید.")
+# Card to card (fill from user message)
+CARD_PAN  = "5029081080984145"
+CARD_NAME = "شهرزاد محمد زاده"
+CARD_NOTE = "پس از کارت‌به‌کارت، رسید را در «کیف پول» ارسال کنید."
+
+# Instagram
+INSTAGRAM_URL = "https://www.instagram.com/bio.crepebar?igsh=MXN1cnljZTN3NGhtZw=="
