@@ -22,8 +22,14 @@ def categories_keyboard():
     buttons = [[InlineKeyboardButton(c["title"], callback_data=f"cat:{c['id']}")] for c in cats]
     return InlineKeyboardMarkup(buttons)
 
-def products_keyboard(cat_id: int, page: int, total: int, page_size: int = 6):
+def products_keyboard(cat_id: int, page: int, total: int, items, page_size: int = 6):
     buttons = []
+    # دکمه‌ی هر محصول
+    for p in items:
+        buttons.append([InlineKeyboardButton(
+            f"{p['name']} — {fmt_money(p['price'])}",
+            callback_data=f"prod:{p['id']}"
+        )])
     # صفحه‌بندی
     nav = []
     if page > 1:
@@ -81,17 +87,22 @@ async def cb_category_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_category(update: Update, context: ContextTypes.DEFAULT_TYPE, cat_id: int, page: int):
     page_size = 6
     items, total = db.list_products_by_category(cat_id, page, page_size)
-    if not items:
-        txt = "در این دسته هنوز محصولی ثبت نشده است."
-    else:
-        lines = [f"🧺 محصولات (صفحه {page})"]
-        for p in items:
-            lines.append(f"• {p['name']} — {fmt_money(p['price'])}")
-        txt = "\n".join(lines)
+    txt = "در این دسته هنوز محصولی ثبت نشده است." if not items else f"🧺 محصولات (صفحه {page})"
+    mark = products_keyboard(cat_id, page, total, items, page_size)
     if update.callback_query:
-        await update.effective_message.edit_text(txt, reply_markup=products_keyboard(cat_id, page, total, page_size))
+        await update.effective_message.edit_text(txt, reply_markup=mark)
     else:
-        await update.effective_chat.send_message(txt, reply_markup=products_keyboard(cat_id, page, total, page_size))
+        await update.effective_chat.send_message(txt, reply_markup=mark)
+
+# ----- Product detail (when user taps a product) -----
+async def cb_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    _, pid = q.data.split(":")
+    row = db.get_product_by_id(int(pid))
+    if not row:
+        return await q.edit_message_text("❗️ محصول پیدا نشد.")
+    txt = f"🛍 {row['name']}\n💵 {fmt_money(row['price'])}\n\n{row['description'] or ''}"
+    await q.edit_message_text(txt)
 
 # ----- Add product (admin only) -----
 async def cb_add_product_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -105,7 +116,7 @@ async def cb_add_product_entry(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def ap_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["ap"]["name"] = update.message.text.strip()
-    await update.message.reply_text("قیمت محصول را به **تومان** بفرستید (مثلاً 85000):", parse_mode="HTML")
+    await update.message.reply_text("قیمت محصول را به <b>تومان</b> بفرستید (مثلاً 85000):", parse_mode="HTML")
     return AP_PRICE
 
 async def ap_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -205,11 +216,9 @@ async def cb_topup_decide(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await context.bot.send_message(tg, f"❌ درخواست شارژ شما رد شد.")
 
-# ----- Orders -----
+# ----- Orders (ورود به منو سفارش) -----
 async def order_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await menu(update, context)
-
-# (برای اختصار: افزودن به سبد با ریپلای نام محصول—می‌تونی بعداً بر اساس دکمه‌ها تکمیل کنی)
 
 # ----- Help -----
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,11 +257,12 @@ def build_handlers():
         CommandHandler("start", start),
         MessageHandler(filters.Regex("^🍭 منو$"), menu),
         MessageHandler(filters.Regex("^🧾 سفارش$"), order_entry),
-        MessageHandler(filters.Regex("^👛 کیف پول$"), wallet),  # برای شروع سریع
+        MessageHandler(filters.Regex("^👛 کیف پول$"), wallet),
         MessageHandler(filters.Regex("^ℹ️ راهنما$"), help_cmd),
 
         CallbackQueryHandler(cb_category,      pattern=r"^cat:\d+$"),
         CallbackQueryHandler(cb_category_page, pattern=r"^catp:\d+:\d+$"),
+        CallbackQueryHandler(cb_product,       pattern=r"^prod:\d+$"),
         CallbackQueryHandler(cb_topup_decide,  pattern=r"^tp[ar]:\d+$"),
 
         conv_add_product,
