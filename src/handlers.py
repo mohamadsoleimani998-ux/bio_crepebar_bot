@@ -1,351 +1,385 @@
-# src/handlers.py
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-import json
+
 from dataclasses import dataclass
+from typing import Optional
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup,
-    KeyboardButton, ReplyKeyboardRemove
-)
-from telegram.ext import (
-    Application, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ConversationHandler, filters,
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton,
+    InputMediaPhoto,
 )
 from telegram.constants import ParseMode
-
-from .base import log, ADMIN_IDS, is_admin, fmt_money, CARD_PAN, CARD_NAME, CARD_NOTE
-from . import db  # از توابع موجود db.py استفاده می‌کنیم
-
-# -------------------------
-# دسته‌بندی‌ها
-# -------------------------
-@dataclass(frozen=True)
-class Cat:
-    key: str
-    title: str
-CATS = [
-    Cat("espresso", "اسپرسو بار گرم و سرد"),
-    Cat("tea",      "چای و دمنوش"),
-    Cat("mixhot",   "ترکیبی گرم"),
-    Cat("mock",     "موکتل ها"),
-    Cat("sky",      "اسمونی ها"),
-    Cat("cool",     "خنک"),
-    Cat("semi",     "دمی"),
-    Cat("crepe",    "کرپ"),
-    Cat("pancake",  "پنکیک"),
-    Cat("diet",     "رژیمی ها"),
-    Cat("matcha",   "ماچا بار"),
-]
-CAT_BY_KEY = {c.key: c for c in CATS}
-
-# -------------------------
-# کیبورد اصلی
-# -------------------------
-MAIN_KB = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("منو 🍭"), KeyboardButton("سفارش 🧾")],
-        [KeyboardButton("کیف پول 👜"), KeyboardButton("راهنما ℹ️")],
-    ], resize_keyboard=True
+from telegram.ext import (
+    Application, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler, filters,
+    ConversationHandler,
 )
 
-# ============ کمکی‌های DB که در db.py نیست ============
-def _create_product(name: str, price: float, cat_key: str) -> int:
-    """محصول جدید. دسته‌بندی در description با برچسب cat:<key> ذخیره می‌شود."""
-    desc = f"cat:{cat_key}"
-    with db._conn() as cn, cn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO products(name, price, description, is_active) VALUES (%s,%s,%s,TRUE) RETURNING product_id",
-            (name.strip(), price, desc)
-        )
-        return cur.fetchone()[0]
+from .base import (
+    log, ADMIN_IDS, is_admin, fmt_money, PAGE_SIZE, CATEGORIES,
+    CARD_PAN, CARD_NAME, CARD_NOTE,
+)
+from . import db
 
-def _list_products_by_cat(cat_key: str, limit=8, offset=0):
-    """فهرست محصول بر اساس دسته."""
-    with db._conn() as cn, cn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM products WHERE is_active=TRUE AND COALESCE(description,'') ILIKE %s",
-                    (f"%cat:{cat_key}%",))
-        total = cur.fetchone()[0]
-        cur.execute(
-            """SELECT product_id, name, price
-               FROM products
-               WHERE is_active=TRUE AND COALESCE(description,'') ILIKE %s
-               ORDER BY product_id DESC
-               LIMIT %s OFFSET %s""",
-            (f"%cat:{cat_key}%", limit, offset)
-        )
-        rows = cur.fetchall()
-        return rows, total
+# ---------- Keyboards ----------
+def main_menu_kb():
+    rows = [
+        [KeyboardButton("🍭 منو"), KeyboardButton("🧾 سفارش")],
+        [KeyboardButton("👛 کیف پول"), KeyboardButton("ℹ️ راهنما")],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-def _insert_wallet_tx(user_id: int, amount: float, kind: str, meta: dict):
-    with db._conn() as cn, cn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO wallet_transactions(user_id, kind, amount, meta) VALUES (%s,%s,%s,%s::jsonb)",
-            (user_id, kind, amount, json.dumps(meta or {}))
-        )
+def categories_kb():
+    rows = [[InlineKeyboardButton(title, callback_data=f"cat:{slug}")] for slug, title in CATEGORIES]
+    return InlineKeyboardMarkup(rows)
 
-# ============ /start ============
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    if u:
-        await context.application.create_task(
-            _ensure_user(context, u.id, u.full_name)
-        )
+def pagination_kb(slug: str, page: int, total: int):
+    pages = (total + PAGE_SIZE - 1)//PAGE_SIZE or 1
+    row = []
+    if page > 1: row.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"cat:{slug}:{page-1}"))
+    row.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="noop"))
+    if page < pages: row.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"cat:{slug}:{page+1}"))
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("🔙 دسته‌ها", callback_data="menu:cats")]])
+
+def cart_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ ثبت نهایی", callback_data="order:submit")],
+        [InlineKeyboardButton("💳 پرداخت کارت‌به‌کارت", callback_data="pay:card")],
+        [InlineKeyboardButton("👛 پرداخت از کیف پول", callback_data="pay:wallet")],
+        [InlineKeyboardButton("🔙 ادامه خرید", callback_data="menu:cats")],
+    ])
+
+def wallet_kb(balance_text: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ شارژ کیف پول", callback_data="wallet:topup")],
+        [InlineKeyboardButton("🔙 منو", callback_data="menu:home")],
+    ])
+
+# ---------- Start / Help ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db.upsert_user(user.id, user.full_name or user.username or "")
     await update.effective_chat.send_message(
-        "سلام 👋 به ربات بایو کِرِپ‌بار خوش اومدی.",
-        reply_markup=MAIN_KB
+        "سلام 😊\nربات فروشگاهی شما آماده است!\nاز منوی پایین استفاده کنید.",
+        reply_markup=main_menu_kb(),
     )
 
-async def _ensure_user(context: ContextTypes.DEFAULT_TYPE, tg_id: int, name: str):
-    try:
-        db.upsert_user(tg_id, name or "")
-    except Exception as e:
-        log.exception("upsert_user failed: %s", e)
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(
+        "• 🍭 منو: انتخاب دسته و افزودن به سبد\n"
+        "• 🧾 سفارش: مشاهده سبد و پرداخت\n"
+        "• 👛 کیف پول: مشاهده موجودی و شارژ با رسید\n"
+        "• پرداخت‌ها: کارت‌به‌کارت یا کیف پول",
+        reply_markup=main_menu_kb(),
+    )
 
-# ============ منو ============
+# ---------- Menu & products ----------
 async def show_categories(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = [[InlineKeyboardButton(c.title, callback_data=f"cat:{c.key}")] for c in CATS]
-    await update.effective_chat.send_message(
-        "دستهٔ محصول را انتخاب کنید:",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+    if update.callback_query:
+        await update.callback_query.answer()
+        target = update.callback_query.message
+    else:
+        target = update.effective_chat
+    await target.send_message("دستهٔ محصول را انتخاب کنید:", reply_markup=categories_kb())
 
-# ============ نمایش محصولات یک دسته ============
-async def cb_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def show_products(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not q: return
     await q.answer()
-    _, cat_key = q.data.split(":", 1)
-    page = int(context.user_data.get("cat_page", 1))
-    rows, total = _list_products_by_cat(cat_key, limit=8, offset=(page-1)*8)
+    parts = q.data.split(":")
+    slug = parts[1]
+    page = int(parts[2]) if len(parts) == 3 else 1
 
-    if not rows:
-        await q.edit_message_text("فعلاً محصولی در این دسته ثبت نشده است.")
+    prods, total = db.list_products_by_category(slug, page, PAGE_SIZE)
+    if not prods:
+        await q.edit_message_text("هنوز محصولی در این دسته ثبت نشده.", reply_markup=pagination_kb(slug, 1, 1))
         return
 
-    buttons = []
-    for pid, name, price in rows:
-        buttons.append([InlineKeyboardButton(f"{name} — {fmt_money(price)}", callback_data=f"noop")])
-    nav = []
-    if page > 1:
-        nav.append(InlineKeyboardButton("◀️ قبلی", callback_data=f"catpg:{cat_key}:{page-1}"))
-    if page*8 < total:
-        nav.append(InlineKeyboardButton("بعدی ▶️", callback_data=f"catpg:{cat_key}:{page+1}"))
-    if nav:
-        buttons.append(nav)
-    buttons.append([InlineKeyboardButton("🔙 بازگشت به دسته‌ها", callback_data="cats")])
+    lines = [f"📦 {p['name']} — {fmt_money(p['price'])}  ▫️ /buy_{p['id']}" for p in prods]
+    text = "لیست محصولات:\n" + "\n".join(lines)
+    await q.edit_message_text(text, reply_markup=pagination_kb(slug, page, total))
 
+# /buy_<id>
+async def quick_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        db.upsert_user(update.effective_user.id, update.effective_user.full_name or "")
+        user = db.get_user(update.effective_user.id)
+
+    prod_id = int(update.message.text.split("_", 1)[1])
+    p = db.get_product(prod_id)
+    if not p:
+        await update.effective_chat.send_message("محصول یافت نشد.")
+        return
+    oid = db.open_draft_order(user["id"])
+    db.add_or_increment_item(oid, p["id"], int(p["price"]), 1)
+    await update.effective_chat.send_message(
+        f"✅ «{p['name']}» به سبد اضافه شد.\n/Cart را ببین:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🧾 مشاهده سبد", callback_data="order:view")]])
+    )
+
+# ---------- Cart / Order ----------
+def _cart_text(order, items):
+    if not order or not items:
+        return "سبد خرید خالی است."
+    lines = []
+    for it in items:
+        lines.append(f"• {it['name']} × {it['qty']} — {fmt_money(it['line_total'])}")
+    lines.append(f"\nجمع کل: {fmt_money(order['total_amount'])}")
+    return "\n".join(lines)
+
+async def view_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query: await update.callback_query.answer()
+    u = db.get_user(update.effective_user.id)
+    order, items = db.get_draft_with_items(u["id"])
+    await (update.callback_query.message if update.callback_query else update.effective_chat).send_message(
+        _cart_text(order, items), reply_markup=cart_kb()
+    )
+
+async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    u = db.get_user(update.effective_user.id)
+    order, items = db.get_draft_with_items(u["id"])
+    if not items:
+        await q.edit_message_text("سبد خالی است.")
+        return
+    await q.edit_message_text("روش پرداخت را انتخاب کنید:", reply_markup=cart_kb())
+
+# ---------- Payments ----------
+async def pay_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    u = db.get_user(update.effective_user.id)
+    order, items = db.get_draft_with_items(u["id"])
+    if not items:
+        await q.edit_message_text("سبد خالی است."); return
+    total = int(order["total_amount"])
+    balance = db.get_balance(u["id"])
+    if balance < total:
+        await q.edit_message_text(f"موجودی کافی نیست. موجودی: {fmt_money(balance)}")
+        return
+    db.add_wallet_tx(u["id"], "order", -total, {"order_id": order["order_id"]})
+    db.set_order_status(order["order_id"], "paid")
+    await q.edit_message_text(f"پرداخت از کیف پول انجام شد ✅\nمبلغ: {fmt_money(total)}")
+    # فاکتور کوتاه
+    await q.message.chat.send_message("🧾 فاکتور شما ثبت شد. سپاس 🙏")
+
+async def pay_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    u = db.get_user(update.effective_user.id)
+    order, items = db.get_draft_with_items(u["id"])
+    if not items:
+        await q.edit_message_text("سبد خالی است."); return
+    total = int(order["total_amount"])
     await q.edit_message_text(
-        f"«{CAT_BY_KEY.get(cat_key).title}»", reply_markup=InlineKeyboardMarkup(buttons)
+        "اطلاعات کارت به کارت:\n"
+        f"• شماره کارت: <code>{CARD_PAN}</code>\n"
+        f"• به نام: {CARD_NAME}\n"
+        f"• مبلغ: <b>{fmt_money(total)}</b>\n"
+        f"• توضیح: {CARD_NOTE}\n\n"
+        "پس از واریز، «رسید» را همین‌جا ارسال کنید تا ادمین تأیید کند.",
+        parse_mode=ParseMode.HTML
     )
+    context.user_data["await_receipt_for_order"] = order["order_id"]
 
-async def cb_cat_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, cat_key, page = q.data.split(":", 2)
-    context.user_data["cat_page"] = int(page)
-    # فراخوانی مجدد
-    q.data = f"cat:{cat_key}"
-    await cb_category(update, context)
-
-async def cb_back_to_cats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    # پیام جدید برای تمیز بودن
-    await show_categories(update, context)
-
-# ============ کیف پول ============
-async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    me = db.get_user(u.id)
-    bal = fmt_money(me["balance"] if me else 0)
-    kb = [
-        [InlineKeyboardButton("شارژ کارت‌به‌کارت 🧾", callback_data="topup:card")],
-    ]
-    await update.effective_chat.send_message(
-        f"موجودی شما: {bal}",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-
-TOPUP_AMT, TOPUP_RECEIPT = range(2)
-
-async def cb_topup_card(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    text = (
-        f"برای شارژ کیف پول، ابتدا مبلغ را بنویسید (عدد):\n\n"
-        f"کارت مقصد: <code>{CARD_PAN}</code>\n"
-        f"به نام: {CARD_NAME}\n{CARD_NOTE}"
-    )
-    await q.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=ReplyKeyboardRemove())
-    return TOPUP_AMT
-
-async def topup_get_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    amt_txt = update.effective_message.text.replace(",", "").replace("٬", "")
-    if not amt_txt.isdigit():
-        await update.effective_message.reply_text("لطفاً فقط عدد وارد کنید (مثلاً 150000).")
-        return TOPUP_AMT
-    amt = float(amt_txt)
-    context.user_data["topup_amt"] = amt
-    await update.effective_message.reply_text(
-        "حالا رسید کارت‌به‌کارت را به صورت «عکس» بفرستید."
-    )
-    return TOPUP_RECEIPT
-
-async def topup_get_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    photo = update.effective_message.photo
+async def handle_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # رسید کارت به کارت یا شارژ کیف پول
+    user = db.get_user(update.effective_user.id)
+    photo = update.message.photo[-1] if update.message.photo else None
+    caption = (update.message.caption or "").strip()
     if not photo:
-        await update.effective_message.reply_text("لطفاً تصویر رسید را ارسال کنید.")
-        return TOPUP_RECEIPT
-
-    amt = context.user_data.get("topup_amt", 0)
-    me = db.get_user(u.id)
-    if not me:
-        db.upsert_user(u.id, u.full_name or "")
-
-    # ارسال برای ادمین‌ها
-    sent_ids = []
-    for admin_id in ADMIN_IDS:
-        try:
-            p = photo[-1]  # بهترین کیفیت
-            caption = f"درخواست شارژ از {u.full_name} (id={u.id})\nمبلغ: {fmt_money(amt)}\n/approve_{u.id}_{int(amt)}  |  /reject_{u.id}"
-            m = await context.bot.send_photo(admin_id, p.file_id, caption=caption)
-            sent_ids.append(m.message_id)
-        except Exception as e:
-            log.warning("forward to admin %s failed: %s", admin_id, e)
-
-    await update.effective_message.reply_text(
-        "درخواست شما ثبت شد و برای ادمین ارسال شد. پس از تایید، کیف پول‌تان شارژ می‌شود.",
-        reply_markup=MAIN_KB
-    )
-    return ConversationHandler.END
-
-async def admin_quick_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """دستورات سریع: /approve_123456789_150000  یا /reject_123456789"""
-    txt = update.effective_message.text or ""
-    if not is_admin(update.effective_user.id):
         return
-    if txt.startswith("/approve_"):
+
+    # اگر برای سفارش در انتظار رسید بود:
+    order_id = context.user_data.pop("await_receipt_for_order", None)
+    if order_id:
+        amount = caption.strip() or "0"
         try:
-            _, uid, amt = txt.split("_", 2)
-            uid = int(uid); amt = float(amt)
-            _insert_wallet_tx(uid, amt, "topup", {"by": "admin"})
-            await update.effective_message.reply_text(f"✅ تایید شد. کیف پول کاربر {uid} به مبلغ {fmt_money(amt)} شارژ شد.")
-        except Exception as e:
-            log.exception("approve failed: %s", e)
-            await update.effective_message.reply_text("خطا در تایید.")
-    elif txt.startswith("/reject_"):
-        try:
-            _, uid = txt.split("_", 1)
-            await update.effective_message.reply_text(f"⛔️ رد شد (user {uid}).")
+            amount_int = int(amount.replace(",", ""))
         except Exception:
-            pass
+            # اگر مبلغ ننویسن، از جمع سفارش بخوانیم
+            order, _ = db.get_draft_with_items(user["id"])
+            amount_int = int(order["total_amount"]) if order else 0
 
-# ============ پنل ادمین: افزودن محصول ============
-ADMIN_ADD_CAT, ADMIN_ADD_NAME, ADMIN_ADD_PRICE = range(3)
+        file_id = photo.file_id
+        text = (f"رسید سفارش جدید 📥\n"
+                f"کاربر: {update.effective_user.full_name} ({update.effective_user.id})\n"
+                f"مبلغ: {fmt_money(amount_int)}\n"
+                f"order_id={order_id}")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ تأیید سفارش", callback_data=f"admin:approve_order:{user['id']}:{order_id}:{amount_int}:{file_id}"),
+            InlineKeyboardButton("❌ رد", callback_data=f"admin:reject:{user['id']}:order"),
+        ]])
+        for admin in ADMIN_IDS:
+            try:
+                await context.bot.send_photo(admin, file_id, caption=text, reply_markup=kb)
+            except Exception as e:
+                log.warning("send to admin failed: %s", e)
+        await update.effective_chat.send_message("رسید ارسال شد. منتظر تأیید ادمین بمانید ✅")
+        return
 
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # شارژ کیف پول
+    amount_int = 0
+    try:
+        amount_int = int(caption.replace(",", ""))
+    except Exception:
+        pass
+    if amount_int <= 0:
+        await update.effective_chat.send_message("برای شارژ کیف پول، مبلغ را در کپشن بنویسید. مثال: 150000")
+        return
+
+    file_id = photo.file_id
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ تأیید شارژ", callback_data=f"admin:approve_topup:{user['id']}:{amount_int}:{file_id}"),
+        InlineKeyboardButton("❌ رد", callback_data=f"admin:reject:{user['id']}:topup"),
+    ]])
+    text = f"درخواست شارژ کیف پول 💳\nکاربر: {update.effective_user.full_name} ({update.effective_user.id})\nمبلغ: {fmt_money(amount_int)}"
+    for admin in ADMIN_IDS:
+        try:
+            await context.bot.send_photo(admin, file_id, caption=text, reply_markup=kb)
+        except Exception as e:
+            log.warning("send to admin failed: %s", e)
+    await update.effective_chat.send_message("رسید شارژ ارسال شد. پس از تأیید ادمین، موجودی شارژ می‌شود.")
+
+# ---------- Wallet ----------
+async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    u = db.get_user(update.effective_user.id)
+    bal = db.get_balance(u["id"])
+    await (update.callback_query.message if update.callback_query else update.effective_chat).send_message(
+        f"موجودی شما: {fmt_money(bal)}", reply_markup=wallet_kb(fmt_money(bal))
+    )
+
+async def wallet_topup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text(
+        "برای شارژ کیف پول:\n"
+        f"۱) کارت به کارت به شماره <code>{CARD_PAN}</code> ({CARD_NAME})\n"
+        "۲) رسید پرداخت را همین‌جا به‌صورت عکس ارسال کنید.\n"
+        "۳) مبلغ را در کپشن عکس بنویسید. مثال: 200000",
+        parse_mode=ParseMode.HTML
+    )
+
+# ---------- Admin: add product ----------
+ADD_CAT, ADD_NAME, ADD_PRICE, ADD_PHOTO, ADD_DESC = range(5)
+
+async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    kb = [
-        [InlineKeyboardButton("➕ افزودن محصول", callback_data="admin:add")],
-    ]
     await update.effective_chat.send_message(
-        "پنل ادمین:", reply_markup=InlineKeyboardMarkup(kb)
+        "پنل ادمین:\n/add_product برای افزودن محصول\n/approve برای لیست در انتظار",
+        reply_markup=main_menu_kb(),
     )
 
-async def admin_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin(q.from_user.id):
-        return
-    kb = [[InlineKeyboardButton(c.title, callback_data=f"aac:{c.key}")]
-          for c in CATS]
-    await q.message.reply_text("دستهٔ محصول را انتخاب کنید:", reply_markup=InlineKeyboardMarkup(kb))
-    return ADMIN_ADD_CAT
+async def add_product_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id): return ConversationHandler.END
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=f"addcat:{s}")] for s, t in CATEGORIES])
+    await update.effective_chat.send_message("دسته را انتخاب کنید:", reply_markup=kb)
+    return ADD_CAT
 
-async def admin_add_choose_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    _, cat_key = q.data.split(":", 1)
-    context.user_data["admin_cat"] = cat_key
-    await q.message.reply_text("نام محصول را وارد کنید:")
-    return ADMIN_ADD_NAME
+async def add_product_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    slug = q.data.split(":",1)[1]
+    context.user_data["new_product"] = {"category": slug}
+    await q.edit_message_text("نام محصول را بفرست:")
+    return ADD_NAME
 
-async def admin_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["admin_name"] = update.effective_message.text.strip()
-    await update.effective_message.reply_text("قیمت را (به تومان) وارد کنید:")
-    return ADMIN_ADD_PRICE
+async def add_product_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_product"]["name"] = update.message.text.strip()
+    await update.message.reply_text("قیمت به تومان (فقط عدد):")
+    return ADD_PRICE
 
-async def admin_add_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.effective_message.text.replace(",", "").replace("٬", "")
-    if not txt.isdigit():
-        await update.effective_message.reply_text("فقط عدد. مثال: 85000")
-        return ADMIN_ADD_PRICE
-    price = float(txt)
-    name = context.user_data.get("admin_name")
-    cat_key = context.user_data.get("admin_cat")
+async def add_product_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        pid = _create_product(name, price, cat_key)
-        await update.effective_message.reply_text(
-            f"✅ محصول ثبت شد.\n#{pid} — {name} — {fmt_money(price)}\nدسته: {CAT_BY_KEY[cat_key].title}",
-            reply_markup=MAIN_KB
-        )
-    except Exception as e:
-        log.exception("create_product failed: %s", e)
-        await update.effective_message.reply_text("❌ خطا در ثبت محصول.", reply_markup=MAIN_KB)
+        price = int(update.message.text.replace(",", ""))
+    except Exception:
+        await update.message.reply_text("قیمت عددی نیست. دوباره بفرست:")
+        return ADD_PRICE
+    context.user_data["new_product"]["price"] = price
+    await update.message.reply_text("اگر عکس دارید بفرستید؛ در غیر اینصورت /skip را بزنید.")
+    return ADD_PHOTO
+
+async def add_product_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    file_id = update.message.photo[-1].file_id if update.message.photo else None
+    context.user_data["new_product"]["photo"] = file_id
+    await update.message.reply_text("توضیح کوتاه (اختیاری). اگر ندارید /skip را بزنید.")
+    return ADD_DESC
+
+async def add_product_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # برای /skip در مراحل عکس/توضیح
+    return await add_product_desc(update, context)
+
+async def add_product_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.text and not update.message.text.startswith("/skip"):
+        context.user_data["new_product"]["desc"] = update.message.text.strip()
+    data = context.user_data.pop("new_product")
+    pid = db.add_product(
+        data.get("name"), data.get("price"), data.get("category"),
+        data.get("photo"), data.get("desc"),
+    )
+    await update.effective_chat.send_message(f"محصول ثبت شد ✅ (id={pid})")
     return ConversationHandler.END
 
-# ============ راهنما ============
-async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
-        "• منو 🍭: دیدن دسته‌ها و محصولات\n"
-        "• کیف پول 👜: مشاهده موجودی و شارژ کارت‌به‌کارت\n"
-        "• ادمین: /admin",
-        reply_markup=MAIN_KB
-    )
+# ---------- Admin approvals ----------
+async def admin_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if not is_admin(update.effective_user.id):
+        await q.answer("اجازه ندارید", show_alert=True); return
+    parts = q.data.split(":")
+    action = parts[1]
+    if action == "approve_topup":
+        user_id, amount, file_id = int(parts[2]), int(parts[3]), parts[4]
+        db.add_wallet_tx(user_id, "topup", amount, {"by":"admin"})
+        await q.edit_message_caption(caption="✅ شارژ تأیید شد.")
+        await context.bot.send_message(user_id, f"شارژ کیف پول شما تأیید شد: {fmt_money(amount)}")
+    elif action == "approve_order":
+        user_id, order_id, amount, file_id = int(parts[2]), int(parts[3]), int(parts[4]), parts[5]
+        # (واریزی برای سفارش) – اینجا بدون برداشت از کیف پول فقط ثبت پرداخت و تغییر وضعیت
+        db.set_order_status(order_id, "paid")
+        await q.edit_message_caption(caption="✅ پرداخت سفارش تأیید شد.")
+        await context.bot.send_message(user_id, "پرداخت شما تأیید شد. سفارش ثبت شد ✅")
+    elif action == "reject":
+        user_id, kind = int(parts[2]), parts[3]
+        await q.edit_message_caption(caption="❌ رد شد.")
+        await context.bot.send_message(user_id, "درخواست شما توسط ادمین رد شد.")
 
-# =====================================================
-# ثبت همه‌ی هندلرها روی Application
-# =====================================================
+# ---------- Router ----------
 def build_handlers(app: Application):
-    # Start / Help / Main buttons
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(MessageHandler(filters.Regex(r"^(?:راهنما|راهنما ℹ️)$"), show_help))
-    app.add_handler(MessageHandler(filters.Regex(r"^(?:منو|منو 🍭)$"), show_categories))
-    app.add_handler(MessageHandler(filters.Regex(r"^(?:کیف پول|کیف پول 👜)$"), wallet_menu))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^🍭 منو$"), show_categories))
+    app.add_handler(MessageHandler(filters.Regex("^🧾 سفارش$"), view_order))
+    app.add_handler(MessageHandler(filters.Regex("^👛 کیف پول$"), wallet_menu))
+    app.add_handler(MessageHandler(filters.Regex("^ℹ️ راهنما$"), help_cmd))
 
-    # دسته‌ها & صفحه‌بندی
-    app.add_handler(CallbackQueryHandler(cb_category, pattern=r"^cat:"))
-    app.add_handler(CallbackQueryHandler(cb_cat_page, pattern=r"^catpg:"))
-    app.add_handler(CallbackQueryHandler(cb_back_to_cats, pattern=r"^cats$"))
+    app.add_handler(CallbackQueryHandler(lambda u,c: show_categories(u,c), pattern="^menu:cats$"))
+    app.add_handler(CallbackQueryHandler(lambda u,c: start(u,c), pattern="^menu:home$"))
 
-    # کیف پول: تاپاپ کارت‌به‌کارت
-    topup_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(cb_topup_card, pattern=r"^topup:card$")],
-        states={
-            TOPUP_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, topup_get_amount)],
-            TOPUP_RECEIPT: [MessageHandler(filters.PHOTO, topup_get_receipt)],
-        },
-        fallbacks=[],
-        name="topup_conv",
-        persistent=False,
-    )
-    app.add_handler(topup_conv)
+    app.add_handler(CallbackQueryHandler(show_products, pattern=r"^cat:"))
+    app.add_handler(MessageHandler(filters.Regex(r"^/buy_\d+$"), quick_buy))
+
+    app.add_handler(CallbackQueryHandler(view_order, pattern="^order:view$"))
+    app.add_handler(CallbackQueryHandler(submit_order, pattern="^order:submit$"))
+    app.add_handler(CallbackQueryHandler(pay_wallet, pattern="^pay:wallet$"))
+    app.add_handler(CallbackQueryHandler(pay_card, pattern="^pay:card$"))
+
+    app.add_handler(CallbackQueryHandler(wallet_topup, pattern="^wallet:topup$"))
+    app.add_handler(CallbackQueryHandler(admin_callbacks, pattern=r"^admin:"))
+
+    # رسیدها (عکس با کپشن مبلغ)
+    app.add_handler(MessageHandler(filters.PHOTO, handle_receipt))
 
     # ادمین
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    admin_add_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_start, pattern=r"^admin:add$")],
-        states={
-            ADMIN_ADD_CAT: [CallbackQueryHandler(admin_add_choose_cat, pattern=r"^aac:")],
-            ADMIN_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_name)],
-            ADMIN_ADD_PRICE:[MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_price)],
-        },
-        fallbacks=[],
-        name="admin_add_conv",
-        persistent=False
-    )
-    app.add_handler(admin_add_conv)
+    app.add_handler(CommandHandler("admin", admin_entry))
 
-    # دستورات سریع ادمین برای تایید/رد شارژ
-    app.add_handler(MessageHandler(filters.Regex(r"^/(?:approve_\d+_\d+|reject_\d+)$"), admin_quick_approve))
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("add_product", add_product_start)],
+        states={
+            ADD_CAT: [CallbackQueryHandler(add_product_cat, pattern="^addcat:")],
+            ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_name)],
+            ADD_PRICE:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_price)],
+            ADD_PHOTO:[MessageHandler(filters.PHOTO, add_product_photo),
+                       CommandHandler("skip", add_product_skip)],
+            ADD_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_product_desc),
+                       CommandHandler("skip", add_product_desc)],
+        },
+        fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)],
+    )
+    app.add_handler(conv)
