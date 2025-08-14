@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
 import psycopg2
-from psycopg2.extras import DictCursor
+from psycopg2.extras import DictCursor, Json
 
 from .base import log, DATABASE_URL, CATEGORIES
 
@@ -36,8 +35,9 @@ CREATE TABLE IF NOT EXISTS settings (
 INSERT INTO settings(key,value) VALUES ('cashback_percent','3')
 ON CONFLICT (key) DO NOTHING;
 
+-- اگر جدول وجود نداشت با ساختار درست ساخته می‌شود.
 CREATE TABLE IF NOT EXISTS categories (
-  slug TEXT PRIMARY KEY,
+  slug  TEXT PRIMARY KEY,
   title TEXT NOT NULL
 );
 
@@ -145,13 +145,61 @@ AFTER UPDATE OF status ON orders
 FOR EACH ROW EXECUTE FUNCTION fn_apply_cashback();
 """
 
+def _col_exists(cur, table: str, col: str) -> bool:
+    cur.execute("""
+        SELECT 1 FROM information_schema.columns
+         WHERE table_name=%s AND column_name=%s
+        LIMIT 1
+    """, (table, col))
+    return cur.fetchone() is not None
+
+def _table_exists(cur, table: str) -> bool:
+    cur.execute("""
+        SELECT 1 FROM information_schema.tables
+         WHERE table_name=%s
+        LIMIT 1
+    """, (table,))
+    return cur.fetchone() is not None
+
+def _ensure_categories_schema():
+    with _conn() as cn, cn.cursor() as cur:
+        # اگر جدول نیست، ساختار کامل را بسازیم (CREATE IF NOT EXISTS در SCHEMA_SQL هم هست، اینجا جهت اطمینان)
+        cur.execute("CREATE TABLE IF NOT EXISTS categories (slug TEXT PRIMARY KEY, title TEXT NOT NULL)")
+
+        # اضافه‌کردن ستون‌ها اگر نبودند
+        cur.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS slug TEXT")
+        cur.execute("ALTER TABLE categories ADD COLUMN IF NOT EXISTS title TEXT")
+
+        # اگر قبلاً ستونی به نام name بوده، title را از آن پر کنیم
+        has_name = _col_exists(cur, "categories", "name")
+        if has_name:
+            cur.execute("UPDATE categories SET title = COALESCE(title, name) WHERE (title IS NULL OR title='') AND name IS NOT NULL")
+
+        # اگر slug خالی است، از title (یا name) بسازیم
+        cur.execute("""
+            UPDATE categories
+               SET slug = COALESCE(slug,
+                                    regexp_replace(lower(COALESCE(title, %s)), '\s+', '_', 'g'))
+             WHERE slug IS NULL OR slug=''
+        """, ("",))
+
+        # ایندکس یکتا روی slug
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_categories_slug ON categories(slug)")
+        cn.commit()
+
 def init_db():
     log.info("init_db() running...")
     _exec(SCHEMA_SQL)
-    # seed categories
+    _ensure_categories_schema()
+
+    # seed categories (به‌روزرسانی عنوان‌ها)
     with _conn() as cn, cn.cursor() as cur:
         for slug, title in CATEGORIES:
-            cur.execute("INSERT INTO categories(slug,title) VALUES(%s,%s) ON CONFLICT (slug) DO UPDATE SET title=EXCLUDED.title", (slug, title))
+            cur.execute("""
+                INSERT INTO categories(slug,title)
+                VALUES(%s,%s)
+                ON CONFLICT (slug) DO UPDATE SET title=EXCLUDED.title
+            """, (slug, title))
     log.info("init_db() done.")
 
 # ---------- users ----------
@@ -247,4 +295,4 @@ def get_balance(user_id: int) -> int:
 def add_wallet_tx(user_id: int, kind: str, amount: int, meta: dict):
     with _conn() as cn, cn.cursor() as cur:
         cur.execute("""INSERT INTO wallet_transactions(user_id,kind,amount,meta)
-                       VALUES(%s,%s,%s,%s)""", (user_id, kind, amount, psycopg2.extras.Json(meta)))
+                       VALUES(%s,%s,%s,%s)""", (user_id, kind, amount, Json(meta)))
