@@ -1,28 +1,42 @@
-import logging, os
+# src/base.py
+import os
+import logging
 
-# ---------- logging ----------
+# ---------- Logging ----------
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL","INFO"),
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
 log = logging.getLogger("crepebar")
 
-# ---------- env / constants ----------
-BOT_TOKEN       = os.environ.get("BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
-DATABASE_URL    = os.environ.get("DATABASE_URL") or os.environ.get("DB_URL")
-PUBLIC_URL      = (os.environ.get("WEBHOOK_URL") or
-                   os.environ.get("WEBHOOK_BASE") or
-                   os.environ.get("PUBLIC_URL") or "")
-WEBHOOK_SECRET  = os.environ.get("WEBHOOK_SECRET","T3legramWebhookSecret_2025")
-CASHBACK_PERCENT= float(os.environ.get("CASHBACK_PERCENT","3"))
-ADMIN_IDS       = [int(x) for x in (os.environ.get("ADMIN_IDS","").replace(" ","") or "").split(",") if x]
+# ---------- Env & constants ----------
+# لیست ادمین‌ها: با کاما جدا کنید
+_admin_env = os.environ.get("ADMIN_IDS", "").strip()
+ADMIN_IDS = set()
+for x in _admin_env.replace("؛", ",").replace(" ", "").split(","):
+    if x.isdigit():
+        ADMIN_IDS.add(int(x))
 
+# واحد پول (نمایشی)
 CURRENCY = "تومان"
 
-# sanity
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is missing")
-if not PUBLIC_URL:
-    raise RuntimeError("PUBLIC_URL/WEBHOOK_URL is missing")
+# اطلاعات کارت برای شارژ کارت‌به‌کارت (اختیاری)
+CARD_PAN   = os.environ.get("CARD_PAN", "6037-xxxx-xxxx-xxxx")
+CARD_NAME  = os.environ.get("CARD_NAME", "به نام فروشگاه")
+CARD_NOTE  = os.environ.get("CARD_NOTE", "لطفاً پس از واریز، رسید را ارسال کنید.")
+
+# ---------- Helpers ----------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def fmt_money(n) -> str:
+    try:
+        f = float(n or 0)
+    except Exception:
+        f = 0.0
+    s = f"{int(round(f)):,}".replace(",", "٬")
+    return f"{s} {CURRENCY}"
+
+def chunk_buttons(items, row=2):
+    for i in range(0, len(items), row):
+        yield items[i:i+row]
