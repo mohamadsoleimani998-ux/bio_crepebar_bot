@@ -1,43 +1,51 @@
-# src/base.py
+# -*- coding: utf-8 -*-
 import os
 import logging
 
-# --- Logging ---
+# ---------- Logging ----------
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | crepebar | %(message)s"
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("crepebar")
 
-# --- ENV / Config ---
-BOT_TOKEN     = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-PUBLIC_URL    = os.getenv("PUBLIC_URL", "").rstrip("/")
-DATABASE_URL  = os.getenv("DATABASE_URL")
-WEBHOOK_SECRET= os.getenv("WEBHOOK_SECRET", "T3legramWebhookSecret_2025")
-PORT          = int(os.getenv("PORT", "8000"))
+# ---------- Env & constants ----------
+# Bot/Webhook
+TOKEN = os.getenv("BOT_TOKEN", "").strip()               # برای سازگاری: handlers/bot از TOKEN استفاده می‌کنند
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")     # مثل https://bio-crepebar-bot.onrender.com
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mysecret")
+PORT = int(os.getenv("PORT", "10000"))
 
-# Admins (comma/space separated)
-ADMIN_IDS = []
-for part in (os.getenv("ADMIN_IDS") or "").replace(",", " ").split():
-    if part.strip().isdigit():
-        ADMIN_IDS.append(int(part.strip()))
+# DB / Settings
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+try:
+    CASHBACK_PERCENT = float(os.getenv("CASHBACK_PERCENT", "3"))
+except Exception:
+    CASHBACK_PERCENT = 0.0
 
-def is_admin(tg_id: int) -> bool:
-    return int(tg_id) in ADMIN_IDS
+# Admins (کاما یا فاصله)
+_admin_ids_env = os.getenv("ADMIN_IDS", "").replace(",", " ").split()
+ADMIN_IDS = [int(x) for x in _admin_ids_env if x.isdigit()]
 
-# Money / currency
+# Payments
+CARD_PAN  = os.getenv("CARD_PAN",  "5029081080984145")
+CARD_NAME = os.getenv("CARD_NAME", "شهرزاد محمد زاده")
+CARD_NOTE = os.getenv("CARD_NOTE", "لطفاً پس از کارت‌به‌کارت، رسید را در ربات ارسال کنید.")
+
+# UI
 CURRENCY = "تومان"
-def fmt_money(x: float|int) -> str:
+
+# ---------- helpers ----------
+def is_admin(tg_id: int) -> bool:
     try:
-        v = int(round(float(x)))
+        return int(tg_id) in ADMIN_IDS
     except Exception:
-        v = 0
-    return f"{v:,} {CURRENCY}".replace(",", "٬")
+        return False
 
-# Card to card (fill from user message)
-CARD_PAN  = "5029081080984145"
-CARD_NAME = "شهرزاد محمد زاده"
-CARD_NOTE = "پس از کارت‌به‌کارت، رسید را در «کیف پول» ارسال کنید."
-
-# Instagram
-INSTAGRAM_URL = "https://www.instagram.com/bio.crepebar?igsh=MXN1cnljZTN3NGhtZw=="
+def fmt_money(v) -> str:
+    try:
+        v = int(round(float(v)))
+    except Exception:
+        return f"{v} {CURRENCY}"
+    s = f"{v:,}".replace(",", "،")  # جداکننده فارسی
+    return f"{s} {CURRENCY}"
