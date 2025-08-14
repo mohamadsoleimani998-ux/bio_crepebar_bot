@@ -1,84 +1,54 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
-
 import os
 import logging
-from decimal import Decimal
-from typing import Iterable, Set
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("crepebar")
+# ------------------ ENV ------------------
+TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip() or None
+PORT = int(os.getenv("PORT", "8080"))
 
-def _env(name: str, default=None, required: bool = False):
-    val = os.environ.get(name, default)
-    if required and (val is None or str(val).strip() == ""):
-        raise RuntimeError(f"{name} is not set")
-    return val
+DATABASE_URL = os.getenv("DATABASE_URL") or os.getenv("DB_URL")
 
-def _parse_admin_ids(val: str | None) -> Set[int]:
-    if not val:
-        return set()
-    parts: Iterable[str] = [p.strip() for p in val.replace("؛", ",").replace(" ", ",").split(",")]
-    out: Set[int] = set()
-    for p in parts:
+# ادمین‌ها: لیست عددی
+def _parse_admin_ids(v: str | None):
+    if not v:
+        return []
+    out = []
+    for p in v.replace(";", ",").split(","):
+        p = p.strip()
         if not p:
             continue
         try:
-            out.add(int(p))
-        except ValueError:
-            log.warning("ADMIN_IDS contains non-numeric value: %r", p)
+            out.append(int(p))
+        except Exception:
+            pass
     return out
 
-def fmt_money(n: int | float | Decimal) -> str:
-    try:
-        v = int(Decimal(n))
-        return f"{v:,} تومان"
-    except Exception:
-        return f"{n} تومان"
+ADMIN_IDS = _parse_admin_ids(os.getenv("ADMIN_IDS"))
 
-def is_admin(tg_id: int) -> bool:
-    return tg_id in ADMIN_IDS
-
-# ---------- ENV ----------
-DATABASE_URL: str = _env("DATABASE_URL", required=True)
-
-BOT_TOKEN: str = _env("BOT_TOKEN", default=_env("TELEGRAM_TOKEN"), required=True)
-
-PUBLIC_URL: str = _env("PUBLIC_URL", default=_env("WEBHOOK_BASE", default="")).rstrip("/")
-
-WEBHOOK_SECRET: str = _env("WEBHOOK_SECRET", default="T3legramWebhookSecret_2025")
-WEBHOOK_PATH: str = _env("WEBHOOK_PATH", default="/telegram-webhook")
-WEBHOOK_URL: str | None = _env("WEBHOOK_URL", default=None) or (f"{PUBLIC_URL}{WEBHOOK_PATH}" if PUBLIC_URL else None)
-
-ADMIN_IDS = _parse_admin_ids(_env("ADMIN_IDS", default=""))
-
-try:
-    CASHBACK_PERCENT: int = int(str(_env("CASHBACK_PERCENT", default="3")).strip())
-except Exception:
-    CASHBACK_PERCENT = 3
-
-# کارت به کارت (اختیاری – برای پیام راهنما)
-CARD_PAN  = _env("CARD_PAN",  default="****-****-****-****")
-CARD_NAME = _env("CARD_NAME", default="دارنده کارت")
-CARD_NOTE = _env("CARD_NOTE", default="پس از واریز، رسید را همین‌جا ارسال کنید.")
-
+# واحد پول
 CURRENCY = "تومان"
-PAGE_SIZE = 6
 
-# دسته‌های منو (slug, title)
-CATEGORIES: list[tuple[str, str]] = [
-    ("espresso", "اسپرسو بار گرم و سرد"),
-    ("tea", "چای و دمنوش"),
-    ("mixhot", "ترکیبی گرم"),
-    ("mocktail", "موکتل ها"),
-    ("sky", "اسمونی ها"),
-    ("cold", "خنک"),
-    ("dami", "دمی"),
-    ("crepe", "کرپ"),
-    ("pancake", "پنکیک"),
-    ("diet", "رژیمی ها"),
-    ("matcha", "ماچا بار"),
-]
+# ------------------ LOG ------------------
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("crepebar")
+
+# ------------------ Helpers ------------------
+def is_admin(tg_id: int) -> bool:
+    return int(tg_id) in ADMIN_IDS
+
+def fmt_money(amount: float | int) -> str:
+    try:
+        n = int(round(float(amount)))
+    except Exception:
+        n = 0
+    s = f"{n:,}".replace(",", "،")
+    return f"{s} {CURRENCY}"
+
+# کارت به کارت (نمایش در صفحه شارژ)
+CARD_PAN  = os.getenv("CARD_PAN", "---- ---- ---- ----")
+CARD_NAME = os.getenv("CARD_NAME", "صاحب حساب")
+CARD_NOTE = os.getenv("CARD_NOTE", "لطفاً بعد از واریز، رسید را ارسال کنید.")
