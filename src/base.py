@@ -11,8 +11,8 @@ log = logging.getLogger("crepebar")
 
 # ---------- Env & constants ----------
 # Bot/Webhook
-TOKEN = os.getenv("BOT_TOKEN", "").strip()               # برای سازگاری: handlers/bot از TOKEN استفاده می‌کنند
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")     # مثل https://bio-crepebar-bot.onrender.com
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "mysecret")
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -23,14 +23,20 @@ try:
 except Exception:
     CASHBACK_PERCENT = 0.0
 
-# Admins (کاما یا فاصله)
+# Admins
 _admin_ids_env = os.getenv("ADMIN_IDS", "").replace(",", " ").split()
 ADMIN_IDS = [int(x) for x in _admin_ids_env if x.isdigit()]
 
-# Payments
+# Payments (defaults filled with what you gave me)
 CARD_PAN  = os.getenv("CARD_PAN",  "5029081080984145")
 CARD_NAME = os.getenv("CARD_NAME", "شهرزاد محمد زاده")
 CARD_NOTE = os.getenv("CARD_NOTE", "لطفاً پس از کارت‌به‌کارت، رسید را در ربات ارسال کنید.")
+
+# Instagram (===> افزوده شد)
+INSTAGRAM_URL = os.getenv(
+    "INSTAGRAM_URL",
+    "https://www.instagram.com/bio.crepebar?igsh=MXN1cnljZTN3NGhtZw==",
+).strip()
 
 # UI
 CURRENCY = "تومان"
@@ -47,5 +53,5 @@ def fmt_money(v) -> str:
         v = int(round(float(v)))
     except Exception:
         return f"{v} {CURRENCY}"
-    s = f"{v:,}".replace(",", "،")  # جداکننده فارسی
+    s = f"{v:,}".replace(",", "،")
     return f"{s} {CURRENCY}"
